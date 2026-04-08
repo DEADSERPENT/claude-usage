@@ -418,6 +418,15 @@ def scan(projects_dir=PROJECTS_DIR, db_path=DB_PATH, verbose=True):
         print(f"  Sessions seen: {len(total_sessions)}")
 
     conn.close()
+
+    # Evaluate threshold hooks after every scan (silently — never crash scanner)
+    try:
+        from hooks import check_and_fire
+        from config import HOOKS_PATH
+        check_and_fire(db_path, HOOKS_PATH)
+    except Exception:
+        pass
+
     return {"new": new_files, "updated": updated_files, "skipped": skipped_files,
             "turns": total_turns, "sessions": len(total_sessions)}
 

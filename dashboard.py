@@ -1,5 +1,6 @@
 """
-dashboard.py - Local web dashboard served on localhost:8080.
+dashboard.py - Local web dashboard.  Port is read from CLAUDE_USAGE_PORT
+(default 8080).  Refresh interval is driven by CLAUDE_USAGE_SCAN_INTERVAL.
 """
 
 import json
@@ -8,7 +9,9 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from datetime import datetime
 
-from config import DB_PATH
+from datetime import timedelta
+
+from config import DB_PATH, PRICING, SCAN_INTERVAL_SECS, DASHBOARD_PORT, DAILY_LIMIT_USD
 
 
 def get_dashboard_data(db_path=DB_PATH):
@@ -56,7 +59,7 @@ def get_dashboard_data(db_path=DB_PATH):
     session_rows = conn.execute("""
         SELECT
             session_id, project_name, first_timestamp, last_timestamp,
-            total_input_tokens, total_output_tokens,
+            git_branch, total_input_tokens, total_output_tokens,
             total_cache_read, total_cache_creation, model, turn_count
         FROM sessions
         ORDER BY last_timestamp DESC
@@ -73,6 +76,7 @@ def get_dashboard_data(db_path=DB_PATH):
         sessions_all.append({
             "session_id":    r["session_id"][:8],
             "project":       r["project_name"] or "unknown",
+            "branch":        r["git_branch"] or "",
             "last":          (r["last_timestamp"] or "")[:16].replace("T", " "),
             "last_date":     (r["last_timestamp"] or "")[:10],
             "duration_min":  duration_min,
@@ -84,12 +88,76 @@ def get_dashboard_data(db_path=DB_PATH):
             "cache_creation": r["total_cache_creation"] or 0,
         })
 
+    # ── Burn rate: tokens in the last 15 minutes ─────────────────────────────
+    fifteen_ago = (datetime.utcnow() - timedelta(minutes=15)).strftime('%Y-%m-%dT%H:%M:%S')
+    burn_row = conn.execute("""
+        SELECT SUM(input_tokens + output_tokens) as tokens
+        FROM turns WHERE timestamp >= ?
+    """, (fifteen_ago,)).fetchone()
+    burn_rate_per_min = round((burn_row["tokens"] or 0) / 15, 1)
+
+    # ── Hourly activity for the last 48 hours (client filters by model) ───────
+    hourly_rows = conn.execute("""
+        SELECT
+            substr(timestamp, 1, 13)   as hour,
+            COALESCE(model, 'unknown') as model,
+            SUM(input_tokens)          as input,
+            SUM(output_tokens)         as output,
+            COUNT(*)                   as turns
+        FROM turns
+        WHERE timestamp >= datetime('now', '-48 hours')
+        GROUP BY hour, model
+        ORDER BY hour
+    """).fetchall()
+    hourly_by_model = [
+        {"hour": r["hour"], "model": r["model"],
+         "input": r["input"] or 0, "output": r["output"] or 0, "turns": r["turns"] or 0}
+        for r in hourly_rows
+    ]
+
+    # ── All-time peak day ─────────────────────────────────────────────────────
+    peak_row = conn.execute("""
+        SELECT substr(timestamp, 1, 10) as day,
+               SUM(input_tokens + output_tokens) as total
+        FROM turns GROUP BY day ORDER BY total DESC LIMIT 1
+    """).fetchone()
+    peak_day = {"day": peak_row["day"], "tokens": peak_row["total"]} if peak_row else None
+
+    # ── Tool usage per day / model (client filters by range + model) ─────────
+    tool_rows = conn.execute("""
+        SELECT
+            tool_name,
+            substr(timestamp, 1, 10)   as day,
+            COALESCE(model, 'unknown') as model,
+            COUNT(*)                   as count
+        FROM turns
+        WHERE tool_name IS NOT NULL
+        GROUP BY tool_name, day, model
+        ORDER BY day
+    """).fetchall()
+    tools_daily = [
+        {"tool": r["tool_name"], "day": r["day"], "model": r["model"], "count": r["count"]}
+        for r in tool_rows
+    ]
+
     conn.close()
 
     return {
         "all_models":     all_models,
         "daily_by_model": daily_by_model,
         "sessions_all":   sessions_all,
+        "tools_daily":      tools_daily,
+        "hourly_by_model":  hourly_by_model,
+        "burn_rate_per_min": burn_rate_per_min,
+        "peak_day":         peak_day,
+        "daily_limit_usd":  DAILY_LIMIT_USD,
+        "pricing":          dict(PRICING),
+        "refresh_ms":       SCAN_INTERVAL_SECS * 1000,
+        "ui_limits": {
+            "sessions_table":  20,
+            "tools_chart":     15,
+            "projects_chart":  10,
+        },
         "generated_at":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -169,6 +237,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .footer-content a { color: var(--blue); text-decoration: none; }
   .footer-content a:hover { text-decoration: underline; }
 
+  .toggle-group { display: flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; flex-shrink: 0; }
+  .toggle-btn { padding: 4px 13px; background: transparent; border: none; border-right: 1px solid var(--border); color: var(--muted); font-size: 12px; cursor: pointer; transition: background 0.15s, color 0.15s; }
+  .toggle-btn:last-child { border-right: none; }
+  .toggle-btn:hover { background: rgba(255,253,250,0.04); color: var(--text); }
+  .toggle-btn.active { background: rgba(224,122,95,0.15); color: var(--accent); font-weight: 600; }
+  .chart-card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+  .chart-card-header h2 { margin-bottom: 0; }
+  #project-filter { background: var(--card); border: 1px solid var(--border); color: var(--muted); font-size: 12px; border-radius: 6px; padding: 4px 8px; cursor: pointer; max-width: 200px; }
+  #project-filter:hover, #project-filter:focus { border-color: var(--accent); color: var(--text); outline: none; }
+
   @media (max-width: 768px) { .charts-grid { grid-template-columns: 1fr; } .chart-card.wide { grid-column: 1; } }
 </style>
 </head>
@@ -191,13 +269,24 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <button class="range-btn" data-range="90d" onclick="setRange('90d')">90d</button>
     <button class="range-btn" data-range="all" onclick="setRange('all')">All</button>
   </div>
+  <div class="filter-sep"></div>
+  <div class="filter-label">Project</div>
+  <select id="project-filter" onchange="onProjectChange(this.value)">
+    <option value="all">All Projects</option>
+  </select>
 </div>
 
 <div class="container">
   <div class="stats-row" id="stats-row"></div>
   <div class="charts-grid">
     <div class="chart-card wide">
-      <h2 id="daily-chart-title">Daily Token Usage</h2>
+      <div class="chart-card-header">
+        <h2 id="daily-chart-title">Daily Token Usage</h2>
+        <div class="toggle-group">
+          <button class="toggle-btn active" data-mode="tokens" onclick="setChartMode('tokens')">Tokens</button>
+          <button class="toggle-btn"        data-mode="cost"   onclick="setChartMode('cost')">Cost ($)</button>
+        </div>
+      </div>
       <div class="chart-wrap tall"><canvas id="chart-daily"></canvas></div>
     </div>
     <div class="chart-card">
@@ -208,12 +297,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <h2>Top Projects by Tokens</h2>
       <div class="chart-wrap"><canvas id="chart-project"></canvas></div>
     </div>
+    <div class="chart-card wide">
+      <h2>Most Used Tools</h2>
+      <div class="chart-wrap"><canvas id="chart-tools"></canvas></div>
+    </div>
+    <div class="chart-card wide">
+      <h2 id="hourly-chart-title">Hourly Activity — Last 48 Hours</h2>
+      <div class="chart-wrap tall"><canvas id="chart-hourly"></canvas></div>
+    </div>
   </div>
   <div class="table-card">
     <div class="section-title">Recent Sessions</div>
     <table>
       <thead><tr>
-        <th>Session</th><th>Project</th><th>Last Active</th><th>Duration</th>
+        <th>Session</th><th>Project</th><th>Branch</th><th>Last Active</th><th>Duration</th>
         <th>Model</th><th>Turns</th><th>Input</th><th>Output</th><th>Est. Cost</th>
       </tr></thead>
       <tbody id="sessions-body"></tbody>
@@ -233,7 +330,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 <footer>
   <div class="footer-content">
-    <p>Cost estimates based on Anthropic API pricing (<a href="https://claude.com/pricing#api" target="_blank">claude.com/pricing#api</a>) as of April 2026. Only models containing <em>opus</em>, <em>sonnet</em>, or <em>haiku</em> in the name are included in cost calculations. Actual costs for Max/Pro subscribers differ from API pricing.</p>
+    <p>Cost estimates based on Anthropic API pricing (<a href="https://claude.com/pricing#api" target="_blank">claude.com/pricing#api</a>). Pricing is loaded from <code>config.py</code> — edit it there when rates change. Only models with an explicit entry in the pricing table are included in cost calculations. Actual costs for Max/Pro subscribers differ from API pricing.</p>
     <p>
       GitHub: <a href="https://github.com/phuryn/claude-usage" target="_blank">https://github.com/phuryn/claude-usage</a>
       &nbsp;&middot;&nbsp;
@@ -254,38 +351,35 @@ function escapeHTML(str) {
 }
 
 // ── State ──────────────────────────────────────────────────────────────────
-let rawData = null;
-let selectedModels = new Set();
-let selectedRange = '30d';
-let charts = {};
+let rawData       = null;
+let selectedModels  = new Set();
+let selectedRange   = '30d';
+let selectedProject = 'all';
+let chartMode       = 'tokens';   // 'tokens' | 'cost'
+let charts          = {};         // charts.dailyMode tracks current daily chart type
 
-// ── Pricing (Anthropic API, April 2026) ────────────────────────────────────
-const PRICING = {
-  'claude-opus-4-6':   { input: 6.15,  output: 30.75, cache_write: 7.69, cache_read: 0.61 },
-  'claude-opus-4-5':   { input: 6.15,  output: 30.75, cache_write: 7.69, cache_read: 0.61 },
-  'claude-sonnet-4-6': { input: 3.69,  output: 18.45, cache_write: 4.61, cache_read: 0.37 },
-  'claude-sonnet-4-5': { input: 3.69,  output: 18.45, cache_write: 4.61, cache_read: 0.37 },
-  'claude-haiku-4-5':  { input: 1.23,  output:  6.15, cache_write: 1.54, cache_read: 0.12 },
-  'claude-haiku-4-6':  { input: 1.23,  output:  6.15, cache_write: 1.54, cache_read: 0.12 },
-};
-
+// ── Pricing (served from config.py — no hardcoded values here) ─────────────
 function isBillable(model) {
-  if (!model) return false;
-  const m = model.toLowerCase();
-  return m.includes('opus') || m.includes('sonnet') || m.includes('haiku');
+  // A model is billable if it has an explicit entry in the server-supplied
+  // pricing table (excludes the 'default' fallback key).
+  if (!model || !rawData || !rawData.pricing) return false;
+  const p = rawData.pricing;
+  if (p[model]) return true;
+  return Object.keys(p).some(k => k !== 'default' && model.startsWith(k));
 }
 
 function getPricing(model) {
-  if (!model) return null;
-  if (PRICING[model]) return PRICING[model];
-  for (const key of Object.keys(PRICING)) {
-    if (model.startsWith(key)) return PRICING[key];
+  const pricing = rawData && rawData.pricing;
+  if (!pricing || !model) return null;
+  if (pricing[model]) return pricing[model];
+  for (const key of Object.keys(pricing)) {
+    if (key !== 'default' && model.startsWith(key)) return pricing[key];
   }
   const m = model.toLowerCase();
-  if (m.includes('opus'))   return PRICING['claude-opus-4-6'];
-  if (m.includes('sonnet')) return PRICING['claude-sonnet-4-6'];
-  if (m.includes('haiku'))  return PRICING['claude-haiku-4-5'];
-  return null;
+  if (m.includes('opus'))   return pricing['claude-opus-4-6']   || pricing['default'];
+  if (m.includes('sonnet')) return pricing['claude-sonnet-4-6'] || pricing['default'];
+  if (m.includes('haiku'))  return pricing['claude-haiku-4-5']  || pricing['default'];
+  return pricing['default'] || null;
 }
 
 function calcCost(model, inp, out, cacheRead, cacheCreation) {
@@ -406,6 +500,31 @@ function clearAllModels() {
   updateURL(); applyFilter();
 }
 
+// ── Project filter ─────────────────────────────────────────────────────────
+function buildProjectFilter(sessions) {
+  const projects = [...new Set(sessions.map(s => s.project))].sort();
+  const select   = document.getElementById('project-filter');
+  const current  = selectedProject;
+  select.innerHTML = '<option value="all">All Projects</option>' +
+    projects.map(p => `<option value="${escapeHTML(p)}">${escapeHTML(p)}</option>`).join('');
+  select.value = projects.includes(current) ? current : 'all';
+  selectedProject  = select.value;
+}
+
+function onProjectChange(val) {
+  selectedProject = val;
+  applyFilter();
+}
+
+// ── Chart-mode toggle ──────────────────────────────────────────────────────
+function setChartMode(mode) {
+  chartMode = mode;
+  document.querySelectorAll('.toggle-btn').forEach(btn =>
+    btn.classList.toggle('active', btn.dataset.mode === mode)
+  );
+  if (rawData) applyFilter();
+}
+
 // ── URL persistence ────────────────────────────────────────────────────────
 function updateURL() {
   const allModels = Array.from(document.querySelectorAll('#model-checkboxes input')).map(cb => cb.value);
@@ -422,12 +541,11 @@ function applyFilter() {
 
   const cutoff = getRangeCutoff(selectedRange);
 
-  // Filter daily rows by model + date range
+  // ── Daily token aggregation (model + date range, no project filter) ──────
   const filteredDaily = rawData.daily_by_model.filter(r =>
     selectedModels.has(r.model) && (!cutoff || r.day >= cutoff)
   );
 
-  // Daily chart: aggregate by day
   const dailyMap = {};
   for (const r of filteredDaily) {
     if (!dailyMap[r.day]) dailyMap[r.day] = { day: r.day, input: 0, output: 0, cache_read: 0, cache_creation: 0 };
@@ -439,31 +557,39 @@ function applyFilter() {
   }
   const daily = Object.values(dailyMap).sort((a, b) => a.day.localeCompare(b.day));
 
-  // By model: aggregate tokens + turns from daily data
+  // ── Daily cost per day (for cost-toggle mode) ─────────────────────────────
+  const dailyCostMap = {};
+  for (const r of filteredDaily) {
+    dailyCostMap[r.day] = (dailyCostMap[r.day] || 0) +
+      calcCost(r.model, r.input, r.output, r.cache_read, r.cache_creation);
+  }
+  const dailyCost = Object.entries(dailyCostMap)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([day, cost]) => ({ day, cost }));
+
+  // ── By model (from daily data, no project filter) ─────────────────────────
   const modelMap = {};
   for (const r of filteredDaily) {
     if (!modelMap[r.model]) modelMap[r.model] = { model: r.model, input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, sessions: 0 };
     const m = modelMap[r.model];
-    m.input          += r.input;
-    m.output         += r.output;
-    m.cache_read     += r.cache_read;
-    m.cache_creation += r.cache_creation;
-    m.turns          += r.turns;
+    m.input += r.input; m.output += r.output;
+    m.cache_read += r.cache_read; m.cache_creation += r.cache_creation;
+    m.turns += r.turns;
   }
 
-  // Filter sessions by model + date range
+  // ── Sessions filtered by model + date + project ───────────────────────────
   const filteredSessions = rawData.sessions_all.filter(s =>
-    selectedModels.has(s.model) && (!cutoff || s.last_date >= cutoff)
+    selectedModels.has(s.model) &&
+    (!cutoff || s.last_date >= cutoff) &&
+    (selectedProject === 'all' || s.project === selectedProject)
   );
 
-  // Add session counts into modelMap
   for (const s of filteredSessions) {
     if (modelMap[s.model]) modelMap[s.model].sessions++;
   }
-
   const byModel = Object.values(modelMap).sort((a, b) => (b.input + b.output) - (a.input + a.output));
 
-  // By project: aggregate from filtered sessions
+  // ── By project ────────────────────────────────────────────────────────────
   const projMap = {};
   for (const s of filteredSessions) {
     if (!projMap[s.project]) projMap[s.project] = { project: s.project, input: 0, output: 0, turns: 0 };
@@ -473,7 +599,32 @@ function applyFilter() {
   }
   const byProject = Object.values(projMap).sort((a, b) => (b.input + b.output) - (a.input + a.output));
 
-  // Totals
+  // ── Cost by model — project-aware ─────────────────────────────────────────
+  let byModelForCost = byModel;
+  if (selectedProject !== 'all') {
+    const sm = {};
+    for (const s of filteredSessions) {
+      if (!sm[s.model]) sm[s.model] = { model: s.model, input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0 };
+      const m = sm[s.model];
+      m.input += s.input; m.output += s.output;
+      m.cache_read += s.cache_read; m.cache_creation += s.cache_creation;
+      m.turns += s.turns;
+    }
+    byModelForCost = Object.values(sm).sort((a, b) => (b.input + b.output) - (a.input + a.output));
+  }
+
+  // ── Tools aggregation (model + date range filter) ─────────────────────────
+  const filteredTools = rawData.tools_daily.filter(r =>
+    selectedModels.has(r.model) && (!cutoff || r.day >= cutoff)
+  );
+  const toolMap = {};
+  for (const r of filteredTools) toolMap[r.tool] = (toolMap[r.tool] || 0) + r.count;
+  const byTool = Object.entries(toolMap)
+    .map(([tool, count]) => ({ tool, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, rawData.ui_limits.tools_chart);
+
+  // ── Totals ────────────────────────────────────────────────────────────────
   const totals = {
     sessions:       filteredSessions.length,
     turns:          byModel.reduce((s, m) => s + m.turns, 0),
@@ -484,15 +635,27 @@ function applyFilter() {
     cost:           byModel.reduce((s, m) => s + calcCost(m.model, m.input, m.output, m.cache_read, m.cache_creation), 0),
   };
 
-  // Update daily chart title
-  document.getElementById('daily-chart-title').textContent = 'Daily Token Usage \u2014 ' + RANGE_LABELS[selectedRange];
+  const modeLabel = chartMode === 'cost' ? 'Daily Cost' : 'Daily Token Usage';
+  document.getElementById('daily-chart-title').textContent = modeLabel + ' \u2014 ' + RANGE_LABELS[selectedRange];
+
+  // ── Hourly chart (last 48h, model-filtered) ───────────────────────────────
+  const filteredHourly = rawData.hourly_by_model.filter(r => selectedModels.has(r.model));
+  const hourlyMap = {};
+  for (const r of filteredHourly) {
+    if (!hourlyMap[r.hour]) hourlyMap[r.hour] = { hour: r.hour, input: 0, output: 0 };
+    hourlyMap[r.hour].input  += r.input;
+    hourlyMap[r.hour].output += r.output;
+  }
+  const byHour = Object.values(hourlyMap).sort((a, b) => a.hour.localeCompare(b.hour));
 
   renderStats(totals);
-  renderDailyChart(daily);
+  renderDailyChart(daily, dailyCost);
   renderModelChart(byModel);
   renderProjectChart(byProject);
-  renderSessionsTable(filteredSessions.slice(0, 20));
-  renderModelCostTable(byModel);
+  renderToolsChart(byTool);
+  renderHourlyChart(byHour);
+  renderSessionsTable(filteredSessions.slice(0, rawData.ui_limits.sessions_table));
+  renderModelCostTable(byModelForCost);
 }
 
 // ── Renderers ──────────────────────────────────────────────────────────────
@@ -505,19 +668,63 @@ function renderStats(t) {
     { label: 'Output Tokens',  value: fmt(t.output),               sub: rangeLabel },
     { label: 'Cache Read',     value: fmt(t.cache_read),           sub: 'from prompt cache' },
     { label: 'Cache Creation', value: fmt(t.cache_creation),       sub: 'writes to prompt cache' },
-    { label: 'Est. Cost',      value: fmtCostBig(t.cost),          sub: 'API pricing, Apr 2026', color: '#6DBF8A' },
+    { label: 'Est. Cost',      value: fmtCostBig(t.cost),          sub: 'see config.py for rates', color: '#6DBF8A' },
   ];
+  if (rawData.burn_rate_per_min > 0) {
+    stats.push({ label: 'Burn Rate',    value: fmt(Math.round(rawData.burn_rate_per_min)) + '/min', sub: 'last 15 minutes' });
+  }
+  if (rawData.peak_day) {
+    stats.push({ label: 'Peak Day',     value: fmt(rawData.peak_day.tokens), sub: rawData.peak_day.day });
+  }
+  if (rawData.daily_limit_usd > 0) {
+    const pct       = Math.min(100, (t.cost / rawData.daily_limit_usd) * 100).toFixed(1);
+    const remaining = Math.max(0, rawData.daily_limit_usd - t.cost);
+    stats.push({ label: 'Daily Budget', value: '$' + remaining.toFixed(2) + ' left',
+      sub: pct + '% of $' + rawData.daily_limit_usd.toFixed(2) + ' used',
+      color: remaining < rawData.daily_limit_usd * 0.2 ? '#E07A5F' : undefined });
+  }
   document.getElementById('stats-row').innerHTML = stats.map(s => `
     <div class="stat-card">
-      <div class="label">${s.label}</div>
-      <div class="value" style="${s.color ? 'color:' + s.color : ''}">${s.value}</div>
-      ${s.sub ? `<div class="sub">${s.sub}</div>` : ''}
+      <div class="label">${escapeHTML(s.label)}</div>
+      <div class="value" style="${s.color ? 'color:' + s.color : ''}">${escapeHTML(s.value)}</div>
+      ${s.sub ? `<div class="sub">${escapeHTML(s.sub)}</div>` : ''}
     </div>
   `).join('');
 }
 
-function renderDailyChart(daily) {
-  if (charts.daily) {
+function renderDailyChart(daily, dailyCost) {
+  const ctx = document.getElementById('chart-daily').getContext('2d');
+
+  if (chartMode === 'cost') {
+    if (charts.daily && charts.dailyMode === 'cost') {
+      charts.daily.data.labels = dailyCost.map(d => d.day);
+      charts.daily.data.datasets[0].data = dailyCost.map(d => d.cost);
+      charts.daily.options.scales.x.ticks.maxTicksLimit = RANGE_TICKS[selectedRange];
+      charts.daily.update('none');
+      return;
+    }
+    if (charts.daily) { charts.daily.destroy(); charts.daily = null; }
+    charts.dailyMode = 'cost';
+    charts.daily = new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels: dailyCost.map(d => d.day),
+        datasets: [{ label: 'Est. Cost ($)', data: dailyCost.map(d => d.cost), backgroundColor: 'rgba(224,122,95,0.75)' }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { labels: { color: '#8C8580', boxWidth: 12 } } },
+        scales: {
+          x: { ticks: { color: '#8C8580', maxTicksLimit: RANGE_TICKS[selectedRange] }, grid: { color: '#3A3733' } },
+          y: { ticks: { color: '#8C8580', callback: v => '$' + v.toFixed(3) }, grid: { color: '#3A3733' } },
+        }
+      }
+    });
+    return;
+  }
+
+  // tokens mode
+  if (charts.daily && charts.dailyMode === 'tokens') {
     charts.daily.data.labels = daily.map(d => d.day);
     charts.daily.data.datasets[0].data = daily.map(d => d.input);
     charts.daily.data.datasets[1].data = daily.map(d => d.output);
@@ -527,7 +734,8 @@ function renderDailyChart(daily) {
     charts.daily.update('none');
     return;
   }
-  const ctx = document.getElementById('chart-daily').getContext('2d');
+  if (charts.daily) { charts.daily.destroy(); charts.daily = null; }
+  charts.dailyMode = 'tokens';
   charts.daily = new Chart(ctx, {
     type: 'bar',
     data: {
@@ -579,7 +787,7 @@ function renderModelChart(byModel) {
 }
 
 function renderProjectChart(byProject) {
-  const top = byProject.slice(0, 10);
+  const top = byProject.slice(0, rawData.ui_limits.projects_chart);
   const labels = top.map(p => p.project.length > 22 ? '\u2026' + p.project.slice(-20) : p.project);
   if (!top.length) {
     if (charts.project) { charts.project.destroy(); charts.project = null; }
@@ -613,15 +821,93 @@ function renderProjectChart(byProject) {
   });
 }
 
+function renderToolsChart(byTool) {
+  if (!byTool.length) {
+    if (charts.tools) { charts.tools.destroy(); charts.tools = null; }
+    return;
+  }
+  if (charts.tools) {
+    charts.tools.data.labels = byTool.map(t => t.tool);
+    charts.tools.data.datasets[0].data = byTool.map(t => t.count);
+    charts.tools.update('none');
+    return;
+  }
+  const ctx = document.getElementById('chart-tools').getContext('2d');
+  charts.tools = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: byTool.map(t => t.tool),
+      datasets: [{
+        label: 'Uses', data: byTool.map(t => t.count),
+        backgroundColor: 'rgba(224,122,95,0.75)', borderColor: 'rgba(224,122,95,1)', borderWidth: 1,
+      }]
+    },
+    options: {
+      indexAxis: 'y', responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: '#8C8580', callback: v => fmt(v) }, grid: { color: '#3A3733' } },
+        y: { ticks: { color: '#8C8580', font: { size: 11 } }, grid: { color: '#3A3733' } },
+      }
+    }
+  });
+}
+
+function renderHourlyChart(byHour) {
+  function fmtHour(h) {
+    const today = new Date().toISOString().slice(0, 10);
+    const yest  = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+    const d = h.slice(0, 10), hr = h.slice(11, 13);
+    if (d === today) return hr + ':00';
+    if (d === yest)  return 'Y ' + hr + ':00';
+    return h.slice(5, 10) + ' ' + hr;
+  }
+  const labels = byHour.map(h => fmtHour(h.hour));
+  if (!byHour.length) {
+    if (charts.hourly) { charts.hourly.destroy(); charts.hourly = null; }
+    return;
+  }
+  if (charts.hourly) {
+    charts.hourly.data.labels = labels;
+    charts.hourly.data.datasets[0].data = byHour.map(h => h.input);
+    charts.hourly.data.datasets[1].data = byHour.map(h => h.output);
+    charts.hourly.update('none');
+    return;
+  }
+  const ctx = document.getElementById('chart-hourly').getContext('2d');
+  charts.hourly = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [
+        { label: 'Input',  data: byHour.map(h => h.input),  backgroundColor: TOKEN_COLORS.input,  stack: 'tokens' },
+        { label: 'Output', data: byHour.map(h => h.output), backgroundColor: TOKEN_COLORS.output, stack: 'tokens' },
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { labels: { color: '#8C8580', boxWidth: 12 } } },
+      scales: {
+        x: { ticks: { color: '#8C8580', maxTicksLimit: 24, font: { size: 10 } }, grid: { color: '#3A3733' } },
+        y: { ticks: { color: '#8C8580', callback: v => fmt(v) }, grid: { color: '#3A3733' } },
+      }
+    }
+  });
+}
+
 function renderSessionsTable(sessions) {
   document.getElementById('sessions-body').innerHTML = sessions.map(s => {
     const cost = calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
     const costCell = isBillable(s.model)
       ? `<td class="cost">${fmtCost(cost)}</td>`
       : `<td class="cost-na">n/a</td>`;
+    const branchCell = s.branch
+      ? `<td class="muted" style="font-size:11px;font-family:monospace">${escapeHTML(s.branch)}</td>`
+      : `<td class="muted">—</td>`;
     return `<tr>
       <td class="muted" style="font-family:monospace">${escapeHTML(s.session_id)}&hellip;</td>
       <td>${escapeHTML(s.project)}</td>
+      ${branchCell}
       <td class="muted">${escapeHTML(s.last)}</td>
       <td class="muted">${escapeHTML(String(s.duration_min))}m</td>
       <td><span class="model-tag">${escapeHTML(s.model)}</span></td>
@@ -652,27 +938,36 @@ function renderModelCostTable(byModel) {
 }
 
 // ── Data loading ───────────────────────────────────────────────────────────
+let _refreshTimer = null;
+
 async function loadData() {
   try {
     const resp = await fetch('/api/data');
     const d = await resp.json();
     if (d.error) {
-      document.body.innerHTML = '<div style="padding:40px;color:#f87171">' + d.error + '</div>';
+      document.body.innerHTML = '<div style="padding:40px;color:#f87171">' + escapeHTML(d.error) + '</div>';
       return;
     }
-    document.getElementById('meta').textContent = 'Updated: ' + d.generated_at + ' \u00b7 Auto-refresh in 30s';
 
     const isFirstLoad = rawData === null;
     rawData = d;
 
+    // Start the auto-refresh timer exactly once, using the server-supplied interval.
+    if (!_refreshTimer) {
+      _refreshTimer = setInterval(loadData, d.refresh_ms);
+    }
+
+    const refreshSecs = Math.round(d.refresh_ms / 1000);
+    document.getElementById('meta').textContent =
+      'Updated: ' + d.generated_at + ' \u00b7 Auto-refresh in ' + refreshSecs + 's';
+
     if (isFirstLoad) {
-      // Restore range from URL, mark active button
       selectedRange = readURLRange();
       document.querySelectorAll('.range-btn').forEach(btn =>
         btn.classList.toggle('active', btn.dataset.range === selectedRange)
       );
-      // Build model filter (reads URL for model selection too)
       buildFilterUI(d.all_models);
+      buildProjectFilter(d.sessions_all);
     }
 
     applyFilter();
@@ -682,7 +977,6 @@ async function loadData() {
 }
 
 loadData();
-setInterval(loadData, 30000);
 </script>
 </body>
 </html>
@@ -714,7 +1008,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
 
-def serve(port=8080):
+def serve(port=None):
+    if port is None:
+        port = DASHBOARD_PORT
     server = ThreadingHTTPServer(("localhost", port), DashboardHandler)
     print(f"Dashboard running at http://localhost:{port}")
     print("Press Ctrl+C to stop.")
