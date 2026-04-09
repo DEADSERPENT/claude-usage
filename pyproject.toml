@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-usage"
+version = "1.0.0"
+description = "Local AI usage observability platform for Claude Code"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+  { name = "DEADSERPENT" }
+]
+keywords = ["claude", "usage", "observability", "analytics", "dashboard", "cli"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Operating System :: OS Independent",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/DEADSERPENT/claude-usage"
+Repository = "https://github.com/DEADSERPENT/claude-usage"
+
+[project.scripts]
+cu = "cli:main"
+
+[tool.setuptools]
+py-modules = [
+  "cli",
+  "config",
+  "scanner",
+  "dashboard",
+  "hooks",
+  "anomaly",
+  "query_engine",
+  "optimizer",
+  "archiver",
+  "api_server",
+  "plugins",
+  "daemon",
+]

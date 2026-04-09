@@ -11,7 +11,22 @@ from datetime import datetime
 
 from datetime import timedelta
 
-from config import DB_PATH, PRICING, SCAN_INTERVAL_SECS, DASHBOARD_PORT, DAILY_LIMIT_USD
+from config import DB_PATH, PRICING, SCAN_INTERVAL_SECS, DASHBOARD_PORT, DAILY_LIMIT_USD, ACTIVE_USER
+
+
+def _calc_cost(model, inp, out, cr, cc):
+    p = PRICING.get(model)
+    if p is None:
+        for key in PRICING:
+            if key != "default" and model and model.startswith(key):
+                p = PRICING[key]
+                break
+    if p is None:
+        p = PRICING.get("default", {})
+    return (
+        inp * p.get("input", 0) / 1e6 + out * p.get("output", 0) / 1e6 +
+        cr * p.get("cache_read", 0) / 1e6 + cc * p.get("cache_write", 0) / 1e6
+    )
 
 
 def get_dashboard_data(db_path=DB_PATH):
@@ -171,6 +186,81 @@ def get_dashboard_data(db_path=DB_PATH):
                 "tool": tr["tool_name"] or "",
             })
 
+    # ── Git branch usage breakdown ────────────────────────────────────────────
+    branch_rows = conn.execute("""
+        SELECT COALESCE(git_branch, '(none)') as branch,
+               SUM(total_input_tokens) as inp,
+               SUM(total_output_tokens) as out,
+               SUM(total_cache_read) as cr,
+               SUM(total_cache_creation) as cc,
+               SUM(turn_count) as turns,
+               COUNT(*) as sessions
+        FROM sessions
+        GROUP BY branch
+        ORDER BY inp + out DESC
+        LIMIT 20
+    """).fetchall()
+    branches = []
+    for r in branch_rows:
+        cost = _calc_cost("default", r["inp"] or 0, r["out"] or 0,
+                          r["cr"] or 0, r["cc"] or 0)
+        branches.append({
+            "branch": r["branch"], "input": r["inp"] or 0,
+            "output": r["out"] or 0, "turns": r["turns"] or 0,
+            "sessions": r["sessions"], "cost": round(cost, 4),
+        })
+
+    # ── Recent anomalies ──────────────────────────────────────────────────────
+    anomalies = []
+    try:
+        anomaly_rows = conn.execute("""
+            SELECT id, detected_at, metric, value, baseline, factor,
+                   severity, message, acknowledged
+            FROM anomalies
+            WHERE detected_at >= datetime('now', '-7 days')
+            ORDER BY detected_at DESC
+            LIMIT 20
+        """).fetchall()
+        anomalies = [dict(r) for r in anomaly_rows]
+    except Exception:
+        pass
+
+    # ── Cost forecast ─────────────────────────────────────────────────────────
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    now = datetime.now()
+    today_total_row = conn.execute("""
+        SELECT SUM(input_tokens) as inp, SUM(output_tokens) as out,
+               SUM(cache_read_tokens) as cr, SUM(cache_creation_tokens) as cc
+        FROM turns WHERE substr(timestamp, 1, 10) = ?
+    """, (today_str,)).fetchone()
+
+    cut2h = (datetime.utcnow() - timedelta(hours=2)).strftime('%Y-%m-%dT%H:%M:%S')
+    burn_2h_row = conn.execute(
+        "SELECT SUM(input_tokens + output_tokens) as t FROM turns WHERE timestamp >= ?",
+        (cut2h,)
+    ).fetchone()
+
+    today_inp = today_total_row["inp"] or 0
+    today_out = today_total_row["out"] or 0
+    today_cr = today_total_row["cr"] or 0
+    today_cc = today_total_row["cc"] or 0
+    today_cost = _calc_cost("default", today_inp, today_out, today_cr, today_cc)
+    today_tokens = today_inp + today_out
+    burn_pm = (burn_2h_row["t"] or 0) / 120
+    cpt = today_cost / max(today_tokens, 1)
+    hours_left = max(0, 24 - now.hour - now.minute / 60)
+    proj_cost = today_cost + burn_pm * 60 * hours_left * cpt
+    proj_tokens = today_tokens + burn_pm * 60 * hours_left
+
+    forecast = {
+        "today_cost": round(today_cost, 4),
+        "today_tokens": today_tokens,
+        "projected_eod_cost": round(proj_cost, 4),
+        "projected_eod_tokens": int(proj_tokens),
+        "burn_rate_per_min": round(burn_pm, 1),
+        "hours_remaining": round(hours_left, 1),
+    }
+
     conn.close()
 
     return {
@@ -196,6 +286,10 @@ def get_dashboard_data(db_path=DB_PATH):
             "scan_interval_secs":  SCAN_INTERVAL_SECS,
         },
         "session_turns": session_turns_map,
+        "branches": branches,
+        "anomalies": anomalies,
+        "forecast": forecast,
+        "active_user": ACTIVE_USER,
     }
 
 
@@ -509,6 +603,40 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <tbody id="sessions-body"></tbody>
     </table>
   </div>
+  <!-- Forecast + Anomalies + Branches -->
+  <div class="charts-grid">
+    <div class="chart-card">
+      <h2>Cost Forecast</h2>
+      <div id="forecast-panel" style="font-size:13px">
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px">
+          <div><span class="muted">Today's cost</span><div id="fc-today-cost" style="font-size:20px;font-weight:700;color:var(--green)">—</div></div>
+          <div><span class="muted">Projected EOD</span><div id="fc-proj-cost" style="font-size:20px;font-weight:700;color:var(--accent)">—</div></div>
+          <div><span class="muted">Burn rate</span><div id="fc-burn" class="num">—</div></div>
+          <div><span class="muted">Hours left</span><div id="fc-hours" class="num">—</div></div>
+          <div><span class="muted">Today's tokens</span><div id="fc-tokens" class="num">—</div></div>
+          <div><span class="muted">Projected tokens</span><div id="fc-proj-tokens" class="num">—</div></div>
+        </div>
+        <div id="fc-limit-bar" style="margin-top:16px;display:none">
+          <div class="muted" style="font-size:11px;margin-bottom:4px">Daily Limit Progress</div>
+          <div style="background:var(--border);border-radius:4px;height:8px;overflow:hidden">
+            <div id="fc-limit-fill" style="height:100%;border-radius:4px;transition:width 0.5s"></div>
+          </div>
+          <div id="fc-limit-text" class="muted" style="font-size:11px;margin-top:4px"></div>
+        </div>
+      </div>
+    </div>
+    <div class="chart-card">
+      <h2>Anomaly Alerts</h2>
+      <div id="anomaly-panel" style="max-height:260px;overflow-y:auto;font-size:13px">
+        <div class="muted">No anomalies detected</div>
+      </div>
+    </div>
+    <div class="chart-card wide">
+      <h2>Git Branch Usage</h2>
+      <div class="chart-wrap"><canvas id="chart-branches"></canvas></div>
+    </div>
+  </div>
+
   <div class="table-card">
     <div class="table-header">
       <div class="section-title" style="margin-bottom:0">Cost by Model</div>
@@ -1485,6 +1613,104 @@ async function loadData() {
   }
 }
 
+// ── Forecast panel ─────────────────────────────────────────────────────────
+function renderForecast(fc) {
+  if (!fc) return;
+  document.getElementById('fc-today-cost').textContent = '$' + fc.today_cost.toFixed(4);
+  document.getElementById('fc-proj-cost').textContent = '$' + fc.projected_eod_cost.toFixed(4);
+  document.getElementById('fc-burn').textContent = fmt(Math.round(fc.burn_rate_per_min)) + '/min';
+  document.getElementById('fc-hours').textContent = fc.hours_remaining.toFixed(1) + 'h';
+  document.getElementById('fc-tokens').textContent = fmt(fc.today_tokens);
+  document.getElementById('fc-proj-tokens').textContent = fmt(fc.projected_eod_tokens);
+
+  if (rawData && rawData.daily_limit_usd > 0) {
+    const bar = document.getElementById('fc-limit-bar');
+    const fill = document.getElementById('fc-limit-fill');
+    const text = document.getElementById('fc-limit-text');
+    bar.style.display = 'block';
+    const pct = Math.min(100, (fc.today_cost / rawData.daily_limit_usd) * 100);
+    fill.style.width = pct + '%';
+    fill.style.background = pct > 80 ? 'var(--accent)' : 'var(--green)';
+    text.textContent = pct.toFixed(1) + '% of $' + rawData.daily_limit_usd.toFixed(2) + ' limit used';
+  }
+}
+
+// ── Anomaly panel ──────────────────────────────────────────────────────────
+function renderAnomalies(anomalies) {
+  const el = document.getElementById('anomaly-panel');
+  if (!anomalies || !anomalies.length) {
+    el.innerHTML = '<div class="muted" style="padding:20px 0;text-align:center">No anomalies detected</div>';
+    return;
+  }
+  const sevColors = { critical: 'var(--accent)', warning: '#E0B86D', info: 'var(--blue)' };
+  el.innerHTML = anomalies.slice(0, 10).map(a => `
+    <div style="padding:8px 0;border-bottom:1px solid var(--border)">
+      <div style="display:flex;align-items:center;gap:6px">
+        <span style="width:8px;height:8px;border-radius:50%;background:${sevColors[a.severity] || 'var(--muted)'};flex-shrink:0"></span>
+        <span style="font-weight:600;font-size:11px;text-transform:uppercase;color:${sevColors[a.severity] || 'var(--muted)'}">${escapeHTML(a.severity)}</span>
+        <span class="muted" style="font-size:11px;margin-left:auto">${escapeHTML((a.detected_at||'').slice(0,16))}</span>
+      </div>
+      <div style="margin-top:4px;font-size:12px">${escapeHTML(a.message)}</div>
+      <div class="muted" style="font-size:11px;margin-top:2px">
+        ${escapeHTML(a.metric)} · value: ${a.value} · baseline: ${a.baseline} · ${a.factor}x
+      </div>
+    </div>
+  `).join('');
+}
+
+// ── Branch chart ───────────────────────────────────────────────────────────
+function renderBranchChart(branches) {
+  const tc = getThemeColors();
+  if (!branches || !branches.length) {
+    if (charts.branches) { charts.branches.destroy(); charts.branches = null; }
+    return;
+  }
+  const top = branches.slice(0, 10);
+  const labels = top.map(b => b.branch.length > 22 ? '\u2026' + b.branch.slice(-20) : b.branch);
+  if (charts.branches) {
+    charts.branches.data.labels = labels;
+    charts.branches.data.datasets[0].data = top.map(b => b.input);
+    charts.branches.data.datasets[1].data = top.map(b => b.output);
+    charts.branches.update('none');
+    return;
+  }
+  const ctx = document.getElementById('chart-branches').getContext('2d');
+  charts.branches = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [
+        { label: 'Input', data: top.map(b => b.input), backgroundColor: TOKEN_COLORS.input },
+        { label: 'Output', data: top.map(b => b.output), backgroundColor: TOKEN_COLORS.output },
+      ]
+    },
+    options: {
+      indexAxis: 'y', responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { labels: { color: tc.legendColor, boxWidth: 12 } },
+        tooltip: { callbacks: { afterLabel: (ctx) => {
+          const b = top[ctx.dataIndex];
+          return b ? 'Cost: $' + b.cost.toFixed(4) + ' · ' + b.sessions + ' sessions' : '';
+        }}}
+      },
+      scales: {
+        x: { ticks: { color: tc.tickColor, callback: v => fmt(v) }, grid: { color: tc.gridColor } },
+        y: { ticks: { color: tc.tickColor, font: { size: 11 } }, grid: { color: tc.gridColor } },
+      }
+    }
+  });
+}
+
+// Patch applyFilter to render new sections
+const _origApplyFilter = applyFilter;
+applyFilter = function() {
+  _origApplyFilter();
+  if (rawData) {
+    renderForecast(rawData.forecast);
+    renderAnomalies(rawData.anomalies);
+    renderBranchChart(rawData.branches);
+  }
+};
+
 loadData();
 </script>
 </body>
@@ -1496,21 +1722,58 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+    def _send_json(self, data, status=200):
+        body = json.dumps(data, default=str).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
+        from urllib.parse import urlparse
+        path = urlparse(self.path).path
+
+        if path in ("/", "/index.html"):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(HTML_TEMPLATE.encode("utf-8"))
 
-        elif self.path == "/api/data":
+        elif path == "/api/data":
             data = get_dashboard_data()
-            body = json.dumps(data).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_json(data)
+
+        elif path == "/api/anomalies":
+            try:
+                from anomaly import get_recent_anomalies
+                anomalies = get_recent_anomalies(DB_PATH)
+                self._send_json({"anomalies": anomalies})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif path == "/api/optimize":
+            try:
+                from optimizer import analyze
+                result = analyze(DB_PATH)
+                self._send_json(result)
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif path == "/api/branches":
+            try:
+                data = get_dashboard_data()
+                self._send_json({"branches": data.get("branches", [])})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif path == "/api/forecast":
+            try:
+                data = get_dashboard_data()
+                self._send_json(data.get("forecast", {}))
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
 
         else:
             self.send_response(404)

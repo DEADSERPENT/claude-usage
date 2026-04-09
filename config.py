@@ -30,6 +30,30 @@ HOOKS_PATH = Path(os.environ.get("CLAUDE_USAGE_HOOKS", str(CLAUDE_DIR / "usage_h
 # 0 = disabled.  Override: export CLAUDE_USAGE_DAILY_LIMIT_USD=10.00
 DAILY_LIMIT_USD = float(os.environ.get("CLAUDE_USAGE_DAILY_LIMIT_USD", "0"))
 
+# ── Multi-User ────────────────────────────────────────────────────────────────
+ACTIVE_USER = os.environ.get("CLAUDE_USAGE_USER", "default")
+USERS_FILE  = Path(os.environ.get("CLAUDE_USAGE_USERS", str(CLAUDE_DIR / "usage_users.json")))
+
+# ── Plugin System ─────────────────────────────────────────────────────────────
+PLUGINS_DIR = Path(os.environ.get("CLAUDE_USAGE_PLUGINS", str(CLAUDE_DIR / "usage_plugins")))
+
+# ── Archival ──────────────────────────────────────────────────────────────────
+ARCHIVE_DIR = Path(os.environ.get("CLAUDE_USAGE_ARCHIVE", str(CLAUDE_DIR / "usage_archives")))
+
+# ── Daemon ────────────────────────────────────────────────────────────────────
+DAEMON_PID_FILE = Path(os.environ.get("CLAUDE_USAGE_PID", str(CLAUDE_DIR / "usage_daemon.pid")))
+DAEMON_LOG_FILE = Path(os.environ.get("CLAUDE_USAGE_DAEMON_LOG", str(CLAUDE_DIR / "usage_daemon.log")))
+
+# ── API Server ────────────────────────────────────────────────────────────────
+API_PORT = int(os.environ.get("CLAUDE_USAGE_API_PORT", "8081"))
+
+# ── Anomaly Detection ─────────────────────────────────────────────────────────
+ANOMALY_WINDOW_DAYS  = int(os.environ.get("CLAUDE_USAGE_ANOMALY_WINDOW", "7"))
+ANOMALY_SPIKE_FACTOR = float(os.environ.get("CLAUDE_USAGE_ANOMALY_FACTOR", "3.0"))
+
+# ── RBAC ──────────────────────────────────────────────────────────────────────
+RBAC_ENABLED = os.environ.get("CLAUDE_USAGE_RBAC", "0") == "1"
+
 # Pricing per million tokens — single source of truth for both CLI and dashboard.
 # Edit these values when Anthropic updates rates; no other file needs changing.
 PRICING: dict[str, dict[str, float]] = {

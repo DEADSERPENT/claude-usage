@@ -1,5 +1,8 @@
 """
 scanner.py - Scans Claude Code JSONL transcript files and stores data in SQLite.
+
+Includes schema migration support for adding new features (user_id, anomalies,
+etc.) to existing databases without data loss.
 """
 
 import json
@@ -9,13 +12,26 @@ import sqlite3
 from pathlib import Path
 from datetime import datetime, timezone
 
-from config import DB_PATH, PROJECTS_DIR
+from config import DB_PATH, PROJECTS_DIR, ACTIVE_USER
 
 
 def get_db(db_path=DB_PATH):
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _column_exists(conn, table: str, column: str) -> bool:
+    cols = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(c["name"] == column for c in cols)
+
+
+def _table_exists(conn, table: str) -> bool:
+    row = conn.execute(
+        "SELECT COUNT(*) as cnt FROM sqlite_master WHERE type='table' AND name=?",
+        (table,)
+    ).fetchone()
+    return row["cnt"] > 0
 
 
 def init_db(conn):
@@ -60,6 +76,48 @@ def init_db(conn):
         CREATE INDEX IF NOT EXISTS idx_turns_timestamp ON turns(timestamp);
         CREATE INDEX IF NOT EXISTS idx_sessions_first ON sessions(first_timestamp);
     """)
+
+    # ── Schema migrations ─────────────────────────────────────────────────────
+    # Add user_id to sessions and turns for multi-user simulation
+    if not _column_exists(conn, "sessions", "user_id"):
+        conn.execute("ALTER TABLE sessions ADD COLUMN user_id TEXT DEFAULT 'default'")
+    if not _column_exists(conn, "turns", "user_id"):
+        conn.execute("ALTER TABLE turns ADD COLUMN user_id TEXT DEFAULT 'default'")
+
+    # Users table for multi-user management
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id     TEXT PRIMARY KEY,
+            display_name TEXT,
+            role        TEXT DEFAULT 'admin',
+            created_at  TEXT DEFAULT (datetime('now')),
+            last_active TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS anomalies (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            detected_at TEXT DEFAULT (datetime('now')),
+            metric      TEXT,
+            value       REAL,
+            baseline    REAL,
+            factor      REAL,
+            severity    TEXT,
+            message     TEXT,
+            session_id  TEXT,
+            user_id     TEXT DEFAULT 'default',
+            acknowledged INTEGER DEFAULT 0
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_anomalies_date ON anomalies(detected_at);
+        CREATE INDEX IF NOT EXISTS idx_turns_user ON turns(user_id);
+        CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+    """)
+
+    # Ensure default user exists
+    conn.execute(
+        "INSERT OR IGNORE INTO users (user_id, display_name, role) VALUES ('default', 'Default User', 'admin')"
+    )
+
     conn.commit()
 
 
@@ -195,7 +253,8 @@ def aggregate_sessions(session_metas, turns):
     return result
 
 
-def upsert_sessions(conn, sessions):
+def upsert_sessions(conn, sessions, user_id=None):
+    uid = user_id or ACTIVE_USER
     for s in sessions:
         # Check if session exists
         existing = conn.execute(
@@ -209,14 +268,14 @@ def upsert_sessions(conn, sessions):
                 INSERT INTO sessions
                     (session_id, project_name, first_timestamp, last_timestamp,
                      git_branch, total_input_tokens, total_output_tokens,
-                     total_cache_read, total_cache_creation, model, turn_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     total_cache_read, total_cache_creation, model, turn_count, user_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 s["session_id"], s["project_name"], s["first_timestamp"],
                 s["last_timestamp"], s["git_branch"],
                 s["total_input_tokens"], s["total_output_tokens"],
                 s["total_cache_read"], s["total_cache_creation"],
-                s["model"], s["turn_count"]
+                s["model"], s["turn_count"], uid
             ))
         else:
             # Update: add new tokens on top of existing (since we only insert new turns)
@@ -239,22 +298,23 @@ def upsert_sessions(conn, sessions):
             ))
 
 
-def insert_turns(conn, turns):
+def insert_turns(conn, turns, user_id=None):
+    uid = user_id or ACTIVE_USER
     conn.executemany("""
         INSERT INTO turns
             (session_id, timestamp, model, input_tokens, output_tokens,
-             cache_read_tokens, cache_creation_tokens, tool_name, cwd)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             cache_read_tokens, cache_creation_tokens, tool_name, cwd, user_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, [
         (t["session_id"], t["timestamp"], t["model"],
          t["input_tokens"], t["output_tokens"],
          t["cache_read_tokens"], t["cache_creation_tokens"],
-         t["tool_name"], t["cwd"])
+         t["tool_name"], t["cwd"], uid)
         for t in turns
     ])
 
 
-def scan(projects_dir=PROJECTS_DIR, db_path=DB_PATH, verbose=True):
+def scan(projects_dir=PROJECTS_DIR, db_path=DB_PATH, verbose=True, user_id=None):
     conn = get_db(db_path)
     init_db(conn)
 
@@ -294,11 +354,7 @@ def scan(projects_dir=PROJECTS_DIR, db_path=DB_PATH, verbose=True):
 
             # For incremental updates: only insert turns not already in DB
             if not is_new:
-                # Get existing turns count to detect which are new
-                # Simple approach: delete old turns for these sessions and re-insert
-                # More correct: track file line count and only process new lines
                 old_lines = row["lines"] if row else 0
-                # Re-parse only if file grew
                 current_lines = sum(1 for _ in open(filepath, encoding="utf-8", errors="replace"))
 
                 if current_lines <= old_lines:
@@ -364,11 +420,9 @@ def scan(projects_dir=PROJECTS_DIR, db_path=DB_PATH, verbose=True):
 
                 turns = new_turns
                 sessions = aggregate_sessions(list(new_metas.values()) or [], turns)
-                # Update session timestamps from full parse
                 for meta in session_metas:
                     sessions_to_update = [s for s in sessions if s["session_id"] == meta["session_id"]]
                     if not sessions_to_update:
-                        # Session exists but no new turns -- still update timestamps
                         sessions.append({**meta,
                                          "total_input_tokens": 0,
                                          "total_output_tokens": 0,
@@ -381,17 +435,14 @@ def scan(projects_dir=PROJECTS_DIR, db_path=DB_PATH, verbose=True):
             else:
                 new_files += 1
 
-            upsert_sessions(conn, sessions)
-            insert_turns(conn, turns)
+            upsert_sessions(conn, sessions, user_id=user_id)
+            insert_turns(conn, turns, user_id=user_id)
 
             for s in sessions:
                 total_sessions.add(s["session_id"])
             total_turns += len(turns)
 
         # Record file as processed.
-        # Don't credit the last line if it's an incomplete JSON write (race
-        # condition where Claude is still writing): the scanner will retry it
-        # on the next run once the write has finished.
         line_count = 0
         last_line = ""
         with open(filepath, encoding="utf-8", errors="replace") as _f:
@@ -424,6 +475,24 @@ def scan(projects_dir=PROJECTS_DIR, db_path=DB_PATH, verbose=True):
         from hooks import check_and_fire
         from config import HOOKS_PATH
         check_and_fire(db_path, HOOKS_PATH)
+    except Exception:
+        pass
+
+    # Run anomaly detection after each scan
+    try:
+        from anomaly import detect_anomalies
+        detect_anomalies(db_path)
+    except Exception:
+        pass
+
+    # Fire plugin hooks
+    try:
+        from plugins import run_hook
+        run_hook("after_scan", {
+            "new": new_files, "updated": updated_files,
+            "skipped": skipped_files, "turns": total_turns,
+            "sessions": len(total_sessions),
+        })
     except Exception:
         pass
 

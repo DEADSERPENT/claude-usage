@@ -1,0 +1,13 @@
+[Unit]
+Description=Claude Usage Daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env cu daemon start --foreground
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
