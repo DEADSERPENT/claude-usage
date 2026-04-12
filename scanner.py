@@ -10,7 +10,7 @@ import os
 import glob
 import sqlite3
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from config import DB_PATH, PROJECTS_DIR, ACTIVE_USER
 
@@ -32,6 +32,97 @@ def _table_exists(conn, table: str) -> bool:
         (table,)
     ).fetchone()
     return row["cnt"] > 0
+
+
+def _get_schema_version(conn) -> int:
+    """Get current schema version from migrations tracking table."""
+    try:
+        row = conn.execute("SELECT MAX(version) as v FROM applied_migrations").fetchone()
+        return row["v"] or 0 if row else 0
+    except Exception:
+        return 0
+
+
+def _apply_migrations(conn):
+    """Apply pending schema migrations."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS applied_migrations (
+            version INTEGER PRIMARY KEY,
+            name TEXT,
+            applied_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+
+    current = _get_schema_version(conn)
+
+    migrations = [
+        (1, "add_tags_table", """
+            CREATE TABLE IF NOT EXISTS tags (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                tag_name TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now')),
+                UNIQUE(session_id, tag_name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_tags_session ON tags(session_id);
+            CREATE INDEX IF NOT EXISTS idx_tags_name ON tags(tag_name);
+        """),
+        (2, "add_rollup_table", """
+            CREATE TABLE IF NOT EXISTS daily_rollups (
+                day TEXT NOT NULL,
+                model TEXT,
+                project_name TEXT,
+                total_input_tokens INTEGER DEFAULT 0,
+                total_output_tokens INTEGER DEFAULT 0,
+                total_cache_read INTEGER DEFAULT 0,
+                total_cache_creation INTEGER DEFAULT 0,
+                turn_count INTEGER DEFAULT 0,
+                session_count INTEGER DEFAULT 0,
+                est_cost_usd REAL DEFAULT 0,
+                rolled_up_at TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (day, model, project_name)
+            );
+        """),
+        (3, "add_fts5_sessions", """
+            CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
+                session_id, project_name, git_branch, model,
+                content='sessions',
+                content_rowid='rowid'
+            );
+        """),
+        (4, "add_webhook_log", """
+            CREATE TABLE IF NOT EXISTS webhook_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fired_at TEXT DEFAULT (datetime('now')),
+                metric TEXT,
+                level TEXT,
+                url TEXT,
+                status TEXT,
+                response_code INTEGER
+            );
+        """),
+        (5, "add_auth_tokens", """
+            CREATE TABLE IF NOT EXISTS auth_tokens (
+                token TEXT PRIMARY KEY,
+                user_id TEXT,
+                created_at TEXT DEFAULT (datetime('now')),
+                expires_at TEXT,
+                role TEXT DEFAULT 'viewer'
+            );
+        """),
+    ]
+
+    for version, name, sql in migrations:
+        if version > current:
+            try:
+                conn.executescript(sql)
+                conn.execute(
+                    "INSERT INTO applied_migrations (version, name) VALUES (?, ?)",
+                    (version, name)
+                )
+                conn.commit()
+            except Exception as e:
+                print(f"  Migration {version} ({name}) failed: {e}")
 
 
 def init_db(conn):
@@ -118,7 +209,100 @@ def init_db(conn):
         "INSERT OR IGNORE INTO users (user_id, display_name, role) VALUES ('default', 'Default User', 'admin')"
     )
 
+    _apply_migrations(conn)
+
     conn.commit()
+
+
+def rebuild_fts(db_path=DB_PATH):
+    """Rebuild the FTS5 index for full-text search."""
+    conn = get_db(db_path)
+    try:
+        conn.execute("DELETE FROM sessions_fts")
+        conn.execute("""
+            INSERT INTO sessions_fts(rowid, session_id, project_name, git_branch, model)
+            SELECT rowid, session_id, COALESCE(project_name, ''),
+                   COALESCE(git_branch, ''), COALESCE(model, '')
+            FROM sessions
+        """)
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+
+def search_sessions_fts(query: str, db_path=DB_PATH, limit: int = 50) -> list[dict]:
+    """Full-text search across sessions."""
+    conn = get_db(db_path)
+    try:
+        rows = conn.execute("""
+            SELECT s.session_id, s.project_name, s.git_branch, s.model,
+                   s.turn_count, s.total_input_tokens, s.total_output_tokens,
+                   s.last_timestamp
+            FROM sessions_fts
+            JOIN sessions s ON s.rowid = sessions_fts.rowid
+            WHERE sessions_fts MATCH ?
+            ORDER BY rank
+            LIMIT ?
+        """, (query, limit)).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+
+def rollup_old_data(db_path=DB_PATH, retention_days: int = 90):
+    """Squash raw turn data older than retention_days into daily aggregates."""
+    from config import calc_cost
+
+    conn = get_db(db_path)
+    cutoff = (datetime.now() - timedelta(days=retention_days)).strftime("%Y-%m-%d")
+
+    # Aggregate old turns into daily_rollups
+    rows = conn.execute("""
+        SELECT substr(timestamp, 1, 10) as day,
+               COALESCE(model, 'unknown') as model,
+               COALESCE(
+                   (SELECT project_name FROM sessions WHERE session_id = t.session_id),
+                   'unknown'
+               ) as project_name,
+               SUM(input_tokens) as inp,
+               SUM(output_tokens) as out,
+               SUM(cache_read_tokens) as cr,
+               SUM(cache_creation_tokens) as cc,
+               COUNT(*) as turn_count,
+               COUNT(DISTINCT session_id) as session_count
+        FROM turns t
+        WHERE substr(timestamp, 1, 10) < ?
+        GROUP BY day, model, project_name
+    """, (cutoff,)).fetchall()
+
+    for r in rows:
+        cost = calc_cost(r["model"], r["inp"] or 0, r["out"] or 0,
+                        r["cr"] or 0, r["cc"] or 0)
+        conn.execute("""
+            INSERT OR REPLACE INTO daily_rollups
+                (day, model, project_name, total_input_tokens, total_output_tokens,
+                 total_cache_read, total_cache_creation, turn_count, session_count, est_cost_usd)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (r["day"], r["model"], r["project_name"],
+              r["inp"] or 0, r["out"] or 0, r["cr"] or 0, r["cc"] or 0,
+              r["turn_count"], r["session_count"], round(cost, 6)))
+
+    # Delete old turns
+    deleted = conn.execute(
+        "DELETE FROM turns WHERE substr(timestamp, 1, 10) < ?", (cutoff,)
+    ).rowcount
+
+    if deleted > 0:
+        conn.execute("VACUUM")
+
+    conn.commit()
+    conn.close()
+
+    return {"rolled_up_days": len(rows), "deleted_turns": deleted, "cutoff": cutoff}
 
 
 def project_name_from_cwd(cwd):
@@ -485,19 +669,46 @@ def scan(projects_dir=PROJECTS_DIR, db_path=DB_PATH, verbose=True, user_id=None)
     except Exception:
         pass
 
+    # Rebuild FTS index
+    try:
+        rebuild_fts(db_path)
+    except Exception:
+        pass
+
     # Fire plugin hooks
     try:
         from plugins import run_hook
-        run_hook("after_scan", {
+        scan_result = {
             "new": new_files, "updated": updated_files,
             "skipped": skipped_files, "turns": total_turns,
             "sessions": len(total_sessions),
-        })
+        }
+        run_hook("after_scan", scan_result)
+    except Exception:
+        pass
+
+    # Fire on_alert for any anomalies detected this scan
+    try:
+        from anomaly import get_recent_anomalies
+        from plugins import run_hook as _run_alert_hook
+        recent = get_recent_anomalies(db_path, days=0, limit=10)
+        for anomaly_record in recent:
+            if not anomaly_record.get("acknowledged"):
+                _run_alert_hook("on_alert", anomaly_record)
+    except Exception:
+        pass
+
+    # Automatic circuit breaker check (runs only when enabled in config)
+    breaker_result = None
+    try:
+        from circuit_breaker import auto_check
+        breaker_result = auto_check(db_path)
     except Exception:
         pass
 
     return {"new": new_files, "updated": updated_files, "skipped": skipped_files,
-            "turns": total_turns, "sessions": len(total_sessions)}
+            "turns": total_turns, "sessions": len(total_sessions),
+            "breaker": breaker_result}
 
 
 if __name__ == "__main__":

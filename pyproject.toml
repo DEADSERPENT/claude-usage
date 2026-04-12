@@ -49,4 +49,8 @@ py-modules = [
   "api_server",
   "plugins",
   "daemon",
+  "circuit_breaker",
+  "invoice",
+  "sync",
+  "tui",
 ]

@@ -120,6 +120,64 @@ Costs are calculated using **Anthropic API pricing as of April 2026** ([claude.c
 
 ---
 
+## Budget Guardian (automatic cost protection)
+
+Set a daily spending limit and the system automatically monitors every scan, warns at thresholds, and can kill Claude processes if the limit is exceeded.
+
+### Quick setup
+
+```bash
+# Set a $10/day limit with automatic enforcement
+export CLAUDE_USAGE_CIRCUIT_BREAKER=1
+export CLAUDE_USAGE_DAILY_LIMIT_USD=10.00
+
+# Start the background daemon — it scans, checks budget, and alerts automatically
+python cli.py daemon start
+```
+
+### How it works
+
+After every scan (manual, dashboard, or daemon), the system:
+
+1. **Checks budget thresholds** at 50%, 80%, and 100% of the daily limit
+2. **Fires notifications** via shell commands and/or webhooks (configured in `~/.claude/usage_hooks.json`)
+3. **Triggers the circuit breaker** when 100% is reached, taking the configured action
+4. **Notifies plugins** via the `on_alert` hook for custom integrations
+
+### Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CLAUDE_USAGE_CIRCUIT_BREAKER` | `0` | Set to `1` to enable automatic checking |
+| `CLAUDE_USAGE_DAILY_LIMIT_USD` | `0` | Daily spending cap in USD (0 = disabled) |
+| `CLAUDE_USAGE_CIRCUIT_BREAKER_ACTION` | `warn` | Action when tripped: `warn`, `kill`, or `block` |
+
+### Actions
+
+| Action | Behavior |
+|--------|----------|
+| `warn` | Logs a warning (default, safe) |
+| `kill` | Terminates running Claude Code processes |
+| `block` | Renames the Claude binary to prevent launching |
+
+### Notification hooks
+
+Add budget-specific hooks to `~/.claude/usage_hooks.json`:
+
+```json
+{
+  "daily_cost_usd": {
+    "warn": 5.00,
+    "critical": 10.00,
+    "on_warn": "notify-send 'Claude Budget' '50%+ of daily limit used'",
+    "on_critical": "notify-send 'Claude Budget' 'Daily limit reached!'",
+    "webhook_url": "http://localhost:5000/budget-alert"
+  }
+}
+```
+
+---
+
 ## Files
 
 | File | Purpose |
@@ -132,3 +190,10 @@ Costs are calculated using **Anthropic API pricing as of April 2026** ([claude.c
 | `anomaly.py` | Usage spike/anomaly detection |
 | `optimizer.py` | Cost optimization recommendations |
 | `archiver.py` | Archive and time-travel helpers for usage history |
+| `circuit_breaker.py` | Automatic budget enforcement and cost protection |
+| `invoice.py` | HTML usage reports (print/PDF/CSV) |
+| `sync.py` | Cross-machine JSON export/import |
+| `tui.py` | Interactive terminal UI (htop-style) |
+| `daemon.py` | Background scanner daemon with file watching |
+| `hooks.py` | Threshold-based shell/webhook notifications |
+| `plugins.py` | Plugin system for extending functionality |

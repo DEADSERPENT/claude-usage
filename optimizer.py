@@ -34,6 +34,76 @@ def _tier_pricing(tier: str) -> dict:
     return PRICING.get(key, PRICING["default"])
 
 
+def analyze_cache_thrashing(db_path: Path = DB_PATH, days: int = 30) -> list[dict]:
+    """Detect sessions with cache thrashing patterns."""
+    if not db_path.exists():
+        return []
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
+
+    sessions = conn.execute("""
+        SELECT session_id,
+               SUM(cache_creation_tokens) as total_cc,
+               SUM(cache_read_tokens) as total_cr,
+               SUM(input_tokens) as total_inp,
+               COUNT(*) as turn_count
+        FROM turns
+        WHERE substr(timestamp, 1, 10) >= ?
+        GROUP BY session_id
+        HAVING total_cc > 0
+        ORDER BY total_cc DESC
+    """, (cutoff,)).fetchall()
+
+    thrashing = []
+    for s in sessions:
+        cc = s["total_cc"] or 0
+        cr = s["total_cr"] or 0
+        inp = s["total_inp"] or 0
+        turns = s["turn_count"] or 0
+
+        if turns < 3 or cc < 10000:
+            continue
+
+        # Cache thrashing: high creation but low read ratio
+        read_ratio = cr / max(cc, 1)
+        creation_per_turn = cc / max(turns, 1)
+
+        if read_ratio < 0.5 and creation_per_turn > 5000:
+            # Get session details
+            sess_row = conn.execute(
+                "SELECT project_name, model, git_branch FROM sessions WHERE session_id = ?",
+                (s["session_id"],)
+            ).fetchone()
+
+            wasted_cost = calc_cost(
+                (sess_row["model"] if sess_row else "default"),
+                0, 0, 0, cc
+            ) - calc_cost(
+                (sess_row["model"] if sess_row else "default"),
+                cc, 0, 0, 0
+            )
+
+            thrashing.append({
+                "session_id": s["session_id"][:8],
+                "full_session_id": s["session_id"],
+                "project": (sess_row["project_name"] if sess_row else "unknown"),
+                "model": (sess_row["model"] if sess_row else "unknown"),
+                "turns": turns,
+                "cache_creation": cc,
+                "cache_read": cr,
+                "read_ratio": round(read_ratio, 3),
+                "creation_per_turn": int(creation_per_turn),
+                "wasted_cost": round(abs(wasted_cost), 6),
+                "severity": "high" if read_ratio < 0.2 else "medium",
+            })
+
+    conn.close()
+    thrashing.sort(key=lambda x: x["wasted_cost"], reverse=True)
+    return thrashing[:20]
+
+
 def analyze(db_path: Path = DB_PATH, days: int = 30) -> dict:
     """
     Run full optimization analysis. Returns dict with:
@@ -41,10 +111,12 @@ def analyze(db_path: Path = DB_PATH, days: int = 30) -> dict:
     - model_breakdown: usage per model tier
     - potential_savings: estimated savings in USD
     - cache_efficiency: cache hit/miss ratio analysis
+    - cache_thrash_sessions: sessions with heavy cache writes vs reads
+    - cache_thrashing: profiler output for sessions with creation-heavy, read-light cache use
     """
     if not db_path.exists():
         return {"suggestions": [], "model_breakdown": {}, "potential_savings": 0,
-                "cache_efficiency": {}}
+                "cache_efficiency": {}, "cache_thrash_sessions": [], "cache_thrashing": []}
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -105,6 +177,22 @@ def analyze(db_path: Path = DB_PATH, days: int = 30) -> dict:
         WHERE tool_name IS NOT NULL AND substr(timestamp, 1, 10) >= ?
         GROUP BY tool_name
         ORDER BY tokens DESC
+        LIMIT 10
+    """, (cutoff,)).fetchall()
+
+    thrash_query_rows = conn.execute("""
+        SELECT session_id,
+               SUM(cache_creation_tokens) as total_create,
+               SUM(cache_read_tokens) as total_read,
+               COUNT(*) as turns
+        FROM turns
+        WHERE substr(timestamp, 1, 10) >= ?
+          AND cache_creation_tokens > 0
+        GROUP BY session_id
+        HAVING total_create > total_read * 3
+           AND total_create > 50000
+           AND turns >= 3
+        ORDER BY total_create DESC
         LIMIT 10
     """, (cutoff,)).fetchall()
 
@@ -230,6 +318,34 @@ def analyze(db_path: Path = DB_PATH, days: int = 30) -> dict:
             })
             total_savings += savings_if_cached
 
+    # ── Cache thrashing detection ──────────────────────────────────────────────
+    cache_thrash_sessions = []
+    total_thrash_waste = 0.0
+    for tr in thrash_query_rows:
+        excess_creation = (tr["total_create"] or 0) - (tr["total_read"] or 0)
+        waste_cost = excess_creation * _tier_pricing("sonnet").get("cache_write", 0) / 1e6
+        total_thrash_waste += waste_cost
+        cache_thrash_sessions.append({
+            "session_id": tr["session_id"][:8],
+            "cache_creation": tr["total_create"] or 0,
+            "cache_read": tr["total_read"] or 0,
+            "turns": tr["turns"],
+            "waste_cost": round(waste_cost, 4),
+        })
+
+    if cache_thrash_sessions:
+        suggestions.append({
+            "type": "cache_thrashing",
+            "priority": "high" if total_thrash_waste > 0.10 else "medium",
+            "title": f"Cache thrashing detected in {len(cache_thrash_sessions)} session(s)",
+            "detail": (f"Sessions repeatedly create cache without reading it, "
+                       f"wasting ~${total_thrash_waste:.4f}. Consider consolidating "
+                       f"prompts to reuse cached context."),
+            "savings": round(total_thrash_waste * 0.7, 4),
+            "thrash_sessions": cache_thrash_sessions,
+        })
+        total_savings += total_thrash_waste * 0.7
+
     # ── Short session analysis ────────────────────────────────────────────────
     short_sessions = [s for s in session_rows if (s["turn_count"] or 0) <= 2]
     if len(short_sessions) > len(session_rows) * 0.3 and len(short_sessions) > 5:
@@ -284,6 +400,21 @@ def analyze(db_path: Path = DB_PATH, days: int = 30) -> dict:
     priority_order = {"high": 0, "medium": 1, "low": 2, "info": 3}
     suggestions.sort(key=lambda s: priority_order.get(s["priority"], 9))
 
+    # Cache thrashing analysis
+    cache_thrashing = analyze_cache_thrashing(db_path, days)
+    if cache_thrashing:
+        total_wasted = sum(t["wasted_cost"] for t in cache_thrashing)
+        if total_wasted > 0.01:
+            suggestions.append({
+                "type": "cache_thrashing",
+                "priority": "high",
+                "title": "Cache thrashing detected",
+                "detail": (f"{len(cache_thrashing)} session(s) are frequently recreating cache "
+                           f"without reading it. Estimated waste: ${total_wasted:.4f}"),
+                "savings": round(total_wasted, 4),
+            })
+            total_savings += total_wasted
+
     return {
         "suggestions": suggestions,
         "model_breakdown": model_breakdown,
@@ -291,6 +422,8 @@ def analyze(db_path: Path = DB_PATH, days: int = 30) -> dict:
         "potential_savings": round(total_savings, 4),
         "total_cost": round(total_cost, 4),
         "cache_efficiency": cache_efficiency,
+        "cache_thrash_sessions": cache_thrash_sessions,
+        "cache_thrashing": cache_thrashing,
         "analysis_period_days": days,
     }
 

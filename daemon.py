@@ -21,7 +21,7 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-from config import SCAN_INTERVAL_SECS, DAEMON_PID_FILE, DAEMON_LOG_FILE
+from config import SCAN_INTERVAL_SECS, DAEMON_PID_FILE, DAEMON_LOG_FILE, PROJECTS_DIR
 
 
 class DaemonLogger:
@@ -46,6 +46,125 @@ class DaemonLogger:
     def info(self, msg):  self.log("INFO", msg)
     def warn(self, msg):  self.log("WARN", msg)
     def error(self, msg): self.log("ERROR", msg)
+
+
+class FileWatcher:
+    """OS-level file watcher. Uses ReadDirectoryChangesW on Windows, polling fallback elsewhere."""
+
+    def __init__(self, watch_dir: str, callback, logger=None):
+        self.watch_dir = watch_dir
+        self.callback = callback
+        self.logger = logger
+        self._stop = threading.Event()
+
+    def start(self):
+        """Start watching in a background thread."""
+        t = threading.Thread(target=self._watch, daemon=True, name="file-watcher")
+        t.start()
+        return t
+
+    def stop(self):
+        self._stop.set()
+
+    def _watch(self):
+        if sys.platform == "win32":
+            self._watch_windows()
+        else:
+            self._watch_poll()
+
+    def _watch_windows(self):
+        """Use ReadDirectoryChangesW via ctypes for instant file change detection."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.windll.kernel32
+
+            FILE_LIST_DIRECTORY = 0x0001
+            OPEN_EXISTING = 3
+            FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+            FILE_NOTIFY_CHANGE_LAST_WRITE = 0x00000010
+            FILE_NOTIFY_CHANGE_FILE_NAME = 0x00000001
+            FILE_NOTIFY_CHANGE_SIZE = 0x00000008
+            INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+            handle = kernel32.CreateFileW(
+                str(self.watch_dir),
+                FILE_LIST_DIRECTORY,
+                0x00000001 | 0x00000002 | 0x00000004,  # FILE_SHARE_READ|WRITE|DELETE
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                None,
+            )
+
+            if handle == INVALID_HANDLE_VALUE:
+                if self.logger:
+                    self.logger.warn("Could not open directory for watching, falling back to polling")
+                self._watch_poll()
+                return
+
+            buf = ctypes.create_string_buffer(4096)
+            bytes_returned = wintypes.DWORD()
+
+            if self.logger:
+                self.logger.info(f"File watcher active (ReadDirectoryChangesW) on {self.watch_dir}")
+
+            while not self._stop.is_set():
+                result = kernel32.ReadDirectoryChangesW(
+                    handle, buf, 4096, True,
+                    FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_SIZE,
+                    ctypes.byref(bytes_returned), None, None,
+                )
+
+                if result and bytes_returned.value > 0:
+                    # Debounce: wait briefly for batch changes
+                    time.sleep(1)
+                    try:
+                        self.callback()
+                    except Exception as e:
+                        if self.logger:
+                            self.logger.error(f"Watcher callback error: {e}")
+
+            kernel32.CloseHandle(handle)
+
+        except Exception as e:
+            if self.logger:
+                self.logger.warn(f"Windows file watcher failed: {e}, falling back to polling")
+            self._watch_poll()
+
+    def _watch_poll(self):
+        """Fallback: poll for mtime changes."""
+        if self.logger:
+            self.logger.info(f"File watcher active (polling) on {self.watch_dir}")
+
+        known_mtimes = {}
+        watch_path = Path(self.watch_dir)
+
+        while not self._stop.is_set():
+            changed = False
+            try:
+                for f in watch_path.rglob("*.jsonl"):
+                    try:
+                        mt = f.stat().st_mtime
+                        if str(f) not in known_mtimes:
+                            known_mtimes[str(f)] = mt
+                        elif mt != known_mtimes[str(f)]:
+                            known_mtimes[str(f)] = mt
+                            changed = True
+                    except OSError:
+                        pass
+            except Exception:
+                pass
+
+            if changed:
+                try:
+                    self.callback()
+                except Exception as e:
+                    if self.logger:
+                        self.logger.error(f"Watcher callback error: {e}")
+
+            self._stop.wait(timeout=5)
 
 
 def _read_pid() -> int | None:
@@ -149,6 +268,35 @@ def _run_foreground(interval: int) -> dict:
     _write_pid()
     pid = os.getpid()
 
+    scan_count = 0
+
+    # Start file watcher for instant scan triggers
+    watcher = None
+    if PROJECTS_DIR.exists():
+        def _on_file_change():
+            nonlocal scan_count
+            try:
+                from scanner import scan
+                result = scan(verbose=False)
+                scan_count += 1
+                turns = result.get("turns", 0)
+                if turns > 0:
+                    logger.info(f"Watcher scan #{scan_count}: {turns} turns (triggered by file change)")
+
+                breaker = result.get("breaker")
+                if breaker:
+                    for alert in breaker.get("budget_alerts", []):
+                        logger.warn(f"Budget alert: {alert['message']} ({alert['severity']})")
+                    br = breaker.get("breaker", {})
+                    if br.get("tripped"):
+                        logger.warn(f"CIRCUIT BREAKER TRIPPED: {br.get('message', '')}")
+            except Exception as e:
+                logger.error(f"Watcher scan error: {e}")
+
+        watcher = FileWatcher(str(PROJECTS_DIR), _on_file_change, logger)
+        watcher.start()
+        logger.info("File watcher started for instant scan triggers")
+
     logger.info(f"Daemon started (PID {pid}, interval {interval}s)")
     print(f"Daemon started (PID {pid})")
     print(f"Scanning every {interval}s. Press Ctrl+C to stop.")
@@ -161,8 +309,6 @@ def _run_foreground(interval: int) -> dict:
 
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
-
-    scan_count = 0
 
     try:
         while not _shutdown.is_set():
@@ -178,6 +324,16 @@ def _run_foreground(interval: int) -> dict:
                 if turns > 0 or new > 0 or updated > 0:
                     logger.info(f"Scan #{scan_count}: {turns} turns, "
                                 f"{new} new files, {updated} updated")
+
+                breaker = result.get("breaker")
+                if breaker:
+                    alerts = breaker.get("budget_alerts", [])
+                    for alert in alerts:
+                        logger.warn(f"Budget alert: {alert['message']} "
+                                    f"({alert['severity']}, {alert['pct_used']}%)")
+                    br = breaker.get("breaker", {})
+                    if br.get("tripped"):
+                        logger.warn(f"CIRCUIT BREAKER TRIPPED: {br.get('message', '')}")
             except Exception as e:
                 logger.error(f"Scan error: {e}")
 
@@ -185,6 +341,8 @@ def _run_foreground(interval: int) -> dict:
     except KeyboardInterrupt:
         pass
     finally:
+        if watcher:
+            watcher.stop()
         _remove_pid()
         logger.info(f"Daemon stopped after {scan_count} scans")
         print(f"\nDaemon stopped (ran {scan_count} scan cycles)")

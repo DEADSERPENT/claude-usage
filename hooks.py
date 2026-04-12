@@ -8,11 +8,13 @@ Create ~/.claude/usage_hooks.json to configure.  Example:
         "warn":        1.00,
         "critical":    5.00,
         "on_warn":     "notify-send 'Claude Usage' 'Daily cost passed $1'",
-        "on_critical": "notify-send 'Claude Usage' 'Daily cost passed $5'"
+        "on_critical": "notify-send 'Claude Usage' 'Daily cost passed $5'",
+        "webhook_url": "http://localhost:5000/hook"
       },
       "daily_tokens": {
         "warn":    500000,
-        "on_warn": "echo 'Claude: 500K tokens used today'"
+        "on_warn": "echo 'Claude: 500K tokens used today'",
+        "on_warn_webhook": "http://localhost:5000/tokens"
       }
     }
 
@@ -24,15 +26,17 @@ Supported metrics (evaluated once per scanner run):
 Each metric block may define:
   warn / critical      Numeric threshold value
   on_warn / on_critical  Shell command executed when threshold is crossed
+  webhook_url          Optional URL: POST JSON for any level without on_*_webhook
+  on_warn_webhook / on_critical_webhook  URL for HTTP POST (JSON) when that level fires
 
-Commands are fired once per threshold crossing per day.  A threshold resets
-(allowing the command to fire again) once usage drops back below 90 % of it.
+Shell commands and webhooks fire once per threshold crossing per day.  A threshold resets
+(allowing them to fire again) once usage drops back below 90 % of it.
 """
 
 import json
 import sqlite3
 import subprocess
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from config import calc_cost
@@ -84,6 +88,22 @@ def _fire(command: str) -> None:
         pass
 
 
+def _fire_webhook(url: str, payload: dict) -> None:
+    """Send an HTTP POST webhook with JSON payload."""
+    import urllib.request
+
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=data,
+            headers={"Content-Type": "application/json", "User-Agent": "claude-usage-hooks/1.0"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=10)
+    except Exception:
+        pass
+
+
 def check_and_fire(db_path: Path, hooks_path: Path) -> None:
     """Load hooks config, evaluate every threshold, fire commands if crossed."""
     if not hooks_path.exists() or not db_path.exists():
@@ -122,14 +142,32 @@ def check_and_fire(db_path: Path, hooks_path: Path) -> None:
         for level in ("critical", "warn"):
             threshold = cfg.get(level)
             command   = cfg.get(f"on_{level}")
-            if threshold is None or not command:
+            webhook   = (
+                cfg.get(f"on_{level}_webhook")
+                or cfg.get(f"on_{level}_url")
+                or cfg.get("webhook_url")
+            )
+            if threshold is None or (not command and not webhook):
                 continue
 
             key           = f"{metric}:{level}"
             already_fired = today_state.get(key, False)
 
             if value >= threshold and not already_fired:
-                _fire(command)
+                if command:
+                    _fire(command)
+                if webhook:
+                    ts = datetime.now(timezone.utc).isoformat()
+                    _fire_webhook(
+                        webhook,
+                        {
+                            "metric": metric,
+                            "value": value,
+                            "threshold": threshold,
+                            "timestamp": ts,
+                            "severity": level,
+                        },
+                    )
                 today_state[key] = True
                 changed = True
             elif value < threshold * 0.9 and already_fired:

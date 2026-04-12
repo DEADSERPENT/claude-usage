@@ -32,6 +32,7 @@ from config import (
     DAILY_LIMIT_USD,
     RBAC_ENABLED,
     ACTIVE_USER,
+    SCAN_INTERVAL_SECS,
     get_pricing_for_model,
     calc_cost as estimate_cost,
 )
@@ -1370,6 +1371,427 @@ def cmd_graph():
     print()
 
 
+def cmd_sync():
+    """Cross-machine data synchronization."""
+    from sync import export_sync, import_sync
+
+    subcmd = sys.argv[2] if len(sys.argv) > 2 else "help"
+
+    if subcmd in ("export", "--export"):
+        since = None
+        output = None
+        args = sys.argv[3:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--since" and i + 1 < len(args):
+                since = args[i + 1]
+                i += 2
+            elif args[i] == "--output" and i + 1 < len(args):
+                output = args[i + 1]
+                i += 2
+            else:
+                i += 1
+        result = export_sync(output_path=Path(output) if output else None, since=since)
+        if result["status"] == "exported":
+            print(f"Exported sync file: {result['path']}")
+            print(f"  Turns: {result['turns']}  Sessions: {result['sessions']}")
+            print(f"  Size: {result['size_bytes']:,} bytes")
+        else:
+            print(f"Error: {result.get('message')}")
+
+    elif subcmd in ("import", "--import"):
+        if len(sys.argv) < 4:
+            print("Usage: python cli.py sync import <path_to_sync_file>")
+            return
+        sync_path = Path(sys.argv[3])
+        result = import_sync(sync_path)
+        if result["status"] == "imported":
+            print(f"Import complete from {result['source_host']}")
+            print(f"  Turns imported: {result['turns_imported']}")
+            print(f"  Turns skipped (duplicates): {result['turns_skipped']}")
+            print(f"  Sessions imported: {result['sessions_imported']}")
+        else:
+            print(f"Error: {result.get('message')}")
+
+    else:
+        print("Usage: python cli.py sync [export|import]")
+        print("  export [--since DATE] [--output PATH]  Export sync file")
+        print("  import <sync_file>                     Import from sync file")
+
+
+def cmd_tag():
+    """Manual tagging and cost allocation."""
+    conn = require_db()
+    conn.row_factory = sqlite3.Row
+
+    subcmd = sys.argv[2] if len(sys.argv) > 2 else "list"
+
+    if subcmd == "list":
+        try:
+            rows = conn.execute("""
+                SELECT tag_name, COUNT(*) as cnt,
+                       SUM(s.total_input_tokens + s.total_output_tokens) as tokens
+                FROM tags t JOIN sessions s ON t.session_id = s.session_id
+                GROUP BY tag_name ORDER BY cnt DESC
+            """).fetchall()
+        except Exception:
+            rows = []
+
+        print()
+        hr('=')
+        print("  Tags & Cost Allocation")
+        hr('=')
+        if not rows:
+            print("  No tags found. Use: python cli.py tag add <session_prefix> <tag_name>")
+        else:
+            for r in rows:
+                print(f"  {r['tag_name']:<25}  sessions={r['cnt']:<4}  tokens={fmt(r['tokens'] or 0)}")
+        print()
+
+    elif subcmd == "add" and len(sys.argv) > 4:
+        session_prefix = sys.argv[3]
+        tag_name = sys.argv[4]
+        sess = conn.execute("SELECT session_id FROM sessions WHERE session_id LIKE ?",
+                          (f"{session_prefix}%",)).fetchone()
+        if not sess:
+            print(f"No session found matching '{session_prefix}'")
+        else:
+            try:
+                conn.execute("INSERT OR IGNORE INTO tags (session_id, tag_name) VALUES (?, ?)",
+                           (sess["session_id"], tag_name))
+                conn.commit()
+                print(f"Tagged session {sess['session_id'][:8]}... as '{tag_name}'")
+            except Exception as e:
+                print(f"Error: {e}")
+
+    elif subcmd == "remove" and len(sys.argv) > 4:
+        session_prefix = sys.argv[3]
+        tag_name = sys.argv[4]
+        conn.execute("DELETE FROM tags WHERE session_id LIKE ? AND tag_name = ?",
+                    (f"{session_prefix}%", tag_name))
+        conn.commit()
+        print(f"Removed tag '{tag_name}' from matching sessions")
+
+    elif subcmd == "sessions" and len(sys.argv) > 3:
+        tag_name = sys.argv[3]
+        rows = conn.execute("""
+            SELECT s.session_id, s.project_name, s.model, s.turn_count,
+                   s.total_input_tokens, s.total_output_tokens
+            FROM tags t JOIN sessions s ON t.session_id = s.session_id
+            WHERE t.tag_name = ?
+            ORDER BY s.last_timestamp DESC
+        """, (tag_name,)).fetchall()
+
+        print(f"\n  Sessions tagged '{tag_name}': {len(rows)}")
+        hr()
+        total_cost = 0
+        for r in rows:
+            cost = calc_cost(r["model"], r["total_input_tokens"] or 0,
+                           r["total_output_tokens"] or 0, 0, 0)
+            total_cost += cost
+            print(f"  {r['session_id'][:8]}  {(r['project_name'] or 'unknown')[:25]:<25}  "
+                  f"{(r['model'] or 'unknown')[:20]:<20}  ${cost:.4f}")
+        hr()
+        print(f"  Total cost: ${total_cost:.4f}")
+        print()
+
+    else:
+        print("Usage: python cli.py tag [list|add|remove|sessions]")
+        print("  list                            List all tags")
+        print("  add <session_prefix> <tag>      Tag a session")
+        print("  remove <session_prefix> <tag>   Remove tag from session")
+        print("  sessions <tag>                  List sessions with tag")
+
+    conn.close()
+
+
+def cmd_simulate():
+    """What-if pricing simulator."""
+    import json as json_mod
+    from config import PRICING, calc_cost_with_pricing
+
+    if len(sys.argv) < 3:
+        print("Usage: python cli.py simulate <pricing_json_file> [--days N]")
+        print('  Example: python cli.py simulate haiku_pricing.json --days 30')
+        print("\n  JSON format: same as PRICING in config.py")
+        print("  Current pricing:")
+        for model, p in PRICING.items():
+            if model != "default":
+                print(f"    {model}: input=${p['input']}/M  output=${p['output']}/M")
+        return
+
+    pricing_path = Path(sys.argv[2])
+    days = 30
+    for i, arg in enumerate(sys.argv):
+        if arg == "--days" and i + 1 < len(sys.argv):
+            days = int(sys.argv[i + 1])
+
+    if not pricing_path.exists():
+        print(f"File not found: {pricing_path}")
+        return
+
+    custom_pricing = json_mod.loads(pricing_path.read_text(encoding="utf-8"))
+
+    conn = require_db()
+    conn.row_factory = sqlite3.Row
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
+
+    rows = conn.execute("""
+        SELECT COALESCE(model, 'unknown') as model,
+               SUM(input_tokens) as inp, SUM(output_tokens) as out,
+               SUM(cache_read_tokens) as cr, SUM(cache_creation_tokens) as cc
+        FROM turns WHERE substr(timestamp, 1, 10) >= ?
+        GROUP BY model ORDER BY inp + out DESC
+    """, (cutoff,)).fetchall()
+    conn.close()
+
+    print()
+    hr('=')
+    print(f"  What-If Pricing Simulator  (last {days} days)")
+    hr('=')
+
+    total_actual = total_sim = 0
+    print(f"\n  {'MODEL':<30} {'ACTUAL':>10} {'SIMULATED':>10} {'DELTA':>10}")
+    print(f"  {'-'*30} {'-'*10} {'-'*10} {'-'*10}")
+
+    for r in rows:
+        actual = calc_cost(r["model"], r["inp"] or 0, r["out"] or 0, r["cr"] or 0, r["cc"] or 0)
+        simulated = calc_cost_with_pricing(custom_pricing, r["model"],
+                                           r["inp"] or 0, r["out"] or 0,
+                                           r["cr"] or 0, r["cc"] or 0)
+        delta = simulated - actual
+        total_actual += actual
+        total_sim += simulated
+        print(f"  {r['model'][:28]:<30} ${actual:>9.4f} ${simulated:>9.4f} ${delta:>+9.4f}")
+
+    hr()
+    delta_total = total_sim - total_actual
+    print(f"  {'TOTAL':<30} ${total_actual:>9.4f} ${total_sim:>9.4f} ${delta_total:>+9.4f}")
+    pct = (delta_total / max(total_actual, 0.0001)) * 100
+    print(f"  Change: {pct:+.1f}% ({'savings' if delta_total < 0 else 'increase'})")
+    hr('=')
+    print()
+
+
+def cmd_rollup():
+    """Manual data retention rollup."""
+    require_role("admin")
+    from scanner import rollup_old_data
+    from config import RETENTION_DAYS
+
+    days = RETENTION_DAYS
+    if len(sys.argv) > 2:
+        try:
+            days = int(sys.argv[2].rstrip("d"))
+        except ValueError:
+            pass
+
+    print(f"Rolling up data older than {days} days...")
+    result = rollup_old_data(DB_PATH, days)
+    print(f"  Rolled up: {result['rolled_up_days']} day-groups")
+    print(f"  Deleted turns: {result['deleted_turns']}")
+    print(f"  Cutoff date: {result['cutoff']}")
+
+
+def cmd_invoice():
+    """Generate standalone HTML invoice/report."""
+    from invoice import generate_invoice
+
+    args = sys.argv[2:]
+    project = None
+    date_from = None
+    date_to = None
+    client = None
+    output = None
+    tag = None
+
+    i = 0
+    while i < len(args):
+        if args[i] == "--project" and i + 1 < len(args):
+            project = args[i + 1]; i += 2
+        elif args[i] == "--from" and i + 1 < len(args):
+            date_from = args[i + 1]; i += 2
+        elif args[i] == "--to" and i + 1 < len(args):
+            date_to = args[i + 1]; i += 2
+        elif args[i] == "--client" and i + 1 < len(args):
+            client = args[i + 1]; i += 2
+        elif args[i] == "--output" and i + 1 < len(args):
+            output = args[i + 1]; i += 2
+        elif args[i] == "--tag" and i + 1 < len(args):
+            tag = args[i + 1]; i += 2
+        else:
+            i += 1
+
+    result = generate_invoice(DB_PATH, project=project, date_from=date_from,
+                             date_to=date_to, client_name=client,
+                             output_path=Path(output) if output else None,
+                             tag=tag)
+
+    if result["status"] == "created":
+        print(f"Invoice generated: {result['path']}")
+        print(f"  Sessions: {result['sessions']}  Total cost: ${result['total_cost']:.4f}")
+    else:
+        print(f"Error: {result.get('message')}")
+
+
+def cmd_tui():
+    """Interactive terminal user interface."""
+    from tui import run_tui
+    run_tui(DB_PATH)
+
+
+def cmd_circuit_breaker():
+    """Circuit breaker quota enforcer."""
+    from circuit_breaker import check_circuit_breaker, get_status, unblock_claude_binary
+    from config import CIRCUIT_BREAKER_ACTION
+
+    subcmd = sys.argv[2] if len(sys.argv) > 2 else "status"
+
+    if subcmd == "status":
+        status = get_status(DB_PATH)
+        print()
+        hr()
+        print("  Circuit Breaker Status")
+        hr()
+        print(f"  Enabled:    {'Yes' if status['enabled'] else 'No (set CLAUDE_USAGE_DAILY_LIMIT_USD)'}")
+        print(f"  Today cost: ${status['today_cost']:.4f}")
+        print(f"  Limit:      ${status['limit']:.2f}")
+        print(f"  Used:       {status['pct_used']:.1f}%")
+        print(f"  Tripped:    {'YES' if status['tripped'] else 'No'}")
+        hr()
+        print()
+
+    elif subcmd == "check":
+        action = CIRCUIT_BREAKER_ACTION
+        if len(sys.argv) > 3:
+            action = sys.argv[3]
+        result = check_circuit_breaker(DB_PATH, action)
+        if result["tripped"]:
+            print(f"  TRIPPED: {result.get('message', '')}")
+        else:
+            print(f"  OK: ${result.get('today_cost', 0):.4f} / ${result.get('limit', 0):.2f}")
+
+    elif subcmd == "unblock":
+        if unblock_claude_binary():
+            print("  Claude binary unblocked.")
+        else:
+            print("  No blocked binary found.")
+
+    else:
+        print("Usage: python cli.py breaker [status|check [action]|unblock]")
+
+
+def cmd_redact_export():
+    """Export with redacted/anonymized project names and paths."""
+    import csv
+    import json as json_mod
+    import hashlib
+
+    format_type = "csv"
+    range_days = None
+    output_path = None
+
+    args = sys.argv[2:]
+    i = 0
+    while i < len(args):
+        if args[i] == "--format" and i + 1 < len(args):
+            format_type = args[i + 1].lower(); i += 2
+        elif args[i] == "--range" and i + 1 < len(args):
+            val = args[i + 1]
+            range_days = int(val.rstrip("d")); i += 2
+        elif args[i] == "--output" and i + 1 < len(args):
+            output_path = args[i + 1]; i += 2
+        else:
+            i += 1
+
+    conn = require_db()
+    conn.row_factory = sqlite3.Row
+
+    query = """SELECT session_id, project_name, first_timestamp, last_timestamp,
+               git_branch, model, turn_count, total_input_tokens, total_output_tokens,
+               total_cache_read, total_cache_creation FROM sessions"""
+    params = []
+    if range_days:
+        cutoff = (date.today() - timedelta(days=range_days)).isoformat()
+        query += " WHERE last_timestamp >= ?"
+        params.append(cutoff)
+    query += " ORDER BY last_timestamp DESC"
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+
+    if not rows:
+        print("No data to export.")
+        return
+
+    def _redact(val):
+        if not val:
+            return val
+        h = hashlib.sha256(val.encode()).hexdigest()[:4].upper()
+        return f"REDACTED_{h}"
+
+    data = []
+    for r in rows:
+        row = dict(r)
+        row["project_name"] = _redact(row["project_name"])
+        row["git_branch"] = _redact(row["git_branch"]) if row["git_branch"] else ""
+        row["est_cost_usd"] = round(calc_cost(
+            row["model"], row["total_input_tokens"] or 0, row["total_output_tokens"] or 0,
+            row["total_cache_read"] or 0, row["total_cache_creation"] or 0), 6)
+        data.append(row)
+
+    if format_type == "json":
+        out_path = output_path or "claude_usage_redacted.json"
+        with open(out_path, "w", encoding="utf-8") as f:
+            json_mod.dump(data, f, indent=2, default=str)
+    else:
+        out_path = output_path or "claude_usage_redacted.csv"
+        fieldnames = list(data[0].keys())
+        with open(out_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in data:
+                writer.writerow(row)
+
+    print(f"Exported {len(data)} redacted sessions to {out_path}")
+
+
+def cmd_search():
+    """Full-text search across sessions."""
+    query = " ".join(sys.argv[2:])
+    if not query:
+        print("Usage: python cli.py search <query>")
+        print("  Searches project names, branches, models, and session IDs")
+        return
+
+    from scanner import search_sessions_fts
+    results = search_sessions_fts(query, DB_PATH)
+
+    if not results:
+        # Fallback to LIKE
+        conn = require_db()
+        conn.row_factory = sqlite3.Row
+        results = [dict(r) for r in conn.execute("""
+            SELECT session_id, project_name, git_branch, model, turn_count,
+                   total_input_tokens, total_output_tokens, last_timestamp
+            FROM sessions
+            WHERE project_name LIKE ? OR git_branch LIKE ? OR model LIKE ?
+            ORDER BY last_timestamp DESC LIMIT 30
+        """, (f"%{query}%", f"%{query}%", f"%{query}%")).fetchall()]
+        conn.close()
+
+    print(f"\n  Search results for '{query}': {len(results)} found\n")
+    print(f"  {'SESSION':<10} {'PROJECT':<30} {'MODEL':<22} {'TURNS':>6} {'LAST':>12}")
+    hr()
+    for r in results:
+        sid = (r.get("session_id", "") or "")[:8]
+        proj = (r.get("project_name", "") or "unknown")[:28]
+        model = (r.get("model", "") or "unknown")[:20]
+        turns = r.get("turn_count", 0) or 0
+        last = (r.get("last_timestamp", "") or "")[:10]
+        print(f"  {sid:<10} {proj:<30} {model:<22} {turns:>6} {last:>12}")
+    print()
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 USAGE = """
@@ -1401,6 +1823,16 @@ Usage:
   python cli.py plugins     Plugin management (plugins list|create)
   python cli.py graph       Dependency graph (projects -> branches -> models)
                             optional: --format mermaid|tree|json
+
+  python cli.py sync        Cross-machine sync (sync export|import)
+  python cli.py tag         Manual tagging (tag list|add|remove|sessions)
+  python cli.py simulate    What-if pricing simulator
+  python cli.py rollup      Data retention rollup
+  python cli.py invoice     Generate HTML invoice/report
+  python cli.py tui         Interactive terminal UI (htop-style)
+  python cli.py breaker     Circuit breaker (breaker status|check|unblock)
+  python cli.py redact      Export with redacted project names
+  python cli.py search      Full-text search across sessions
 
 Environment variables:
   CLAUDE_USAGE_DB              Path to SQLite database
@@ -1437,6 +1869,16 @@ COMMANDS = {
     "users":      cmd_users,
     "plugins":    cmd_plugins,
     "graph":      cmd_graph,
+    "sync":       cmd_sync,
+    "tag":        cmd_tag,
+    "simulate":   cmd_simulate,
+    "rollup":     cmd_rollup,
+    "invoice":    cmd_invoice,
+    "tui":        cmd_tui,
+    "htop":       cmd_tui,          # alias
+    "breaker":    cmd_circuit_breaker,
+    "redact":     cmd_redact_export,
+    "search":     cmd_search,
 }
 
 def main():

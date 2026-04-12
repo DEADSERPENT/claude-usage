@@ -254,6 +254,36 @@ def get_dashboard_data(db_path=DB_PATH):
         "hours_remaining": round(hours_left, 1),
     }
 
+    # ── Heatmap data (365 days) ──────────────────────────────────────────────
+    heatmap_rows = conn.execute("""
+        SELECT substr(timestamp, 1, 10) as day,
+               SUM(input_tokens + output_tokens) as tokens,
+               COUNT(*) as turns
+        FROM turns
+        WHERE timestamp >= date('now', '-365 days')
+        GROUP BY day ORDER BY day
+    """).fetchall()
+    heatmap = [{"day": r["day"], "tokens": r["tokens"] or 0, "turns": r["turns"] or 0} for r in heatmap_rows]
+
+    # ── Tags data ────────────────────────────────────────────────────────────
+    tags = []
+    try:
+        tag_rows = conn.execute("""
+            SELECT tag_name, COUNT(*) as cnt FROM tags GROUP BY tag_name ORDER BY cnt DESC
+        """).fetchall()
+        tags = [{"name": r["tag_name"], "count": r["cnt"]} for r in tag_rows]
+    except Exception:
+        pass
+
+    # ── Cache thrashing summary ──────────────────────────────────────────────
+    cache_thrash_count = 0
+    try:
+        from optimizer import analyze_cache_thrashing
+        thrashing = analyze_cache_thrashing(db_path, 30)
+        cache_thrash_count = len(thrashing)
+    except Exception:
+        pass
+
     conn.close()
 
     return {
@@ -283,6 +313,9 @@ def get_dashboard_data(db_path=DB_PATH):
         "anomalies": anomalies,
         "forecast": forecast,
         "active_user": ACTIVE_USER,
+        "heatmap": heatmap,
+        "tags": tags,
+        "cache_thrash_count": cache_thrash_count,
     }
 
 
@@ -466,6 +499,85 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .shortcut-list li { display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; color: var(--text); border-bottom: 1px solid var(--border); }
   .shortcut-list li:last-child { border-bottom: none; }
 
+  /* ── Command Palette ────────────────────────────────────────────── */
+  .cmd-palette { position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 3000; display: flex; align-items: flex-start; justify-content: center; padding-top: 15vh; opacity: 0; pointer-events: none; transition: opacity 0.15s; }
+  .cmd-palette.visible { opacity: 1; pointer-events: auto; }
+  .cmd-palette-box { background: var(--card); border: 1px solid var(--border); border-radius: 12px; width: 520px; max-height: 400px; overflow: hidden; box-shadow: 0 20px 60px rgba(0,0,0,0.4); }
+  .cmd-palette-input { width: 100%; padding: 14px 18px; background: transparent; border: none; border-bottom: 1px solid var(--border); color: var(--text); font-size: 15px; outline: none; }
+  .cmd-palette-input::placeholder { color: var(--muted); }
+  .cmd-palette-results { max-height: 300px; overflow-y: auto; }
+  .cmd-result { padding: 10px 18px; cursor: pointer; display: flex; align-items: center; gap: 10px; font-size: 13px; border-bottom: 1px solid var(--border); }
+  .cmd-result:hover, .cmd-result.selected { background: rgba(224,122,95,0.1); color: var(--text); }
+  .cmd-result .cmd-icon { color: var(--muted); font-size: 14px; width: 20px; text-align: center; }
+  .cmd-result .cmd-label { flex: 1; }
+  .cmd-result .cmd-hint { color: var(--muted); font-size: 11px; }
+
+  /* ── Heatmap ────────────────────────────────────────────────────── */
+  .heatmap-wrap { overflow-x: auto; padding: 8px 0; }
+  .heatmap-grid { display: flex; gap: 2px; }
+  .heatmap-col { display: flex; flex-direction: column; gap: 2px; }
+  .heatmap-cell { width: 11px; height: 11px; border-radius: 2px; background: var(--border); transition: background 0.15s; cursor: pointer; }
+  .heatmap-cell:hover { outline: 1px solid var(--text); outline-offset: 1px; }
+  .heatmap-label { font-size: 9px; color: var(--muted); text-align: center; margin-top: 4px; }
+  .heatmap-legend { display: flex; align-items: center; gap: 4px; margin-top: 8px; font-size: 10px; color: var(--muted); }
+  .heatmap-legend-cell { width: 11px; height: 11px; border-radius: 2px; }
+
+  /* ── Drag-and-drop ──────────────────────────────────────────────── */
+  .draggable-card { transition: transform 0.2s, opacity 0.2s; }
+  .draggable-card.dragging { opacity: 0.4; transform: scale(0.98); }
+  .draggable-card.drag-over { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(224,122,95,0.3); }
+  .drag-handle { cursor: grab; color: var(--muted); font-size: 14px; margin-right: 6px; user-select: none; }
+  .drag-handle:active { cursor: grabbing; }
+
+  /* ── Query Playground ───────────────────────────────────────────── */
+  .query-playground { font-family: monospace; }
+  .query-input { width: 100%; padding: 10px 14px; background: var(--bg); border: 1px solid var(--border); color: var(--text); font-family: monospace; font-size: 13px; border-radius: 6px; outline: none; resize: vertical; min-height: 40px; }
+  .query-input:focus { border-color: var(--accent); }
+  .query-results { margin-top: 12px; max-height: 300px; overflow-y: auto; font-size: 12px; }
+  .query-error { color: var(--accent); font-size: 12px; margin-top: 6px; }
+  .query-hint { color: var(--muted); font-size: 11px; margin-top: 6px; }
+
+  /* ── Theme builder ──────────────────────────────────────────────── */
+  .theme-builder { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; margin-top: 12px; }
+  .theme-color-item { display: flex; align-items: center; gap: 6px; font-size: 11px; }
+  .theme-color-input { width: 28px; height: 28px; border: 1px solid var(--border); border-radius: 4px; padding: 0; cursor: pointer; background: transparent; }
+  .theme-preset-group { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+  .theme-preset { padding: 3px 10px; border-radius: 4px; border: 1px solid var(--border); background: transparent; color: var(--muted); font-size: 11px; cursor: pointer; }
+  .theme-preset:hover { border-color: var(--accent); color: var(--text); }
+
+  /* ── Plugin panel ───────────────────────────────────────────────── */
+  .plugin-card { display: flex; align-items: center; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+  .plugin-card:last-child { border-bottom: none; }
+  .plugin-toggle { position: relative; width: 36px; height: 20px; }
+  .plugin-toggle input { opacity: 0; width: 0; height: 0; }
+  .plugin-slider { position: absolute; inset: 0; background: var(--border); border-radius: 10px; cursor: pointer; transition: background 0.2s; }
+  .plugin-slider::before { content: ''; position: absolute; width: 16px; height: 16px; left: 2px; top: 2px; background: var(--text); border-radius: 50%; transition: transform 0.2s; }
+  .plugin-toggle input:checked + .plugin-slider { background: var(--green); }
+  .plugin-toggle input:checked + .plugin-slider::before { transform: translateX(16px); }
+
+  /* ── Time machine slider ────────────────────────────────────────── */
+  .time-slider-wrap { padding: 8px 0; }
+  .time-slider { width: 100%; cursor: pointer; accent-color: var(--accent); }
+
+  /* ── Webhook builder ────────────────────────────────────────────── */
+  .webhook-form { display: grid; gap: 10px; }
+  .webhook-form input, .webhook-form select { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 6px 10px; border-radius: 4px; font-size: 12px; outline: none; }
+  .webhook-form input:focus { border-color: var(--accent); }
+
+  /* ── Dep graph ──────────────────────────────────────────────────── */
+  .graph-node { cursor: pointer; }
+  .graph-node:hover circle { stroke: var(--accent); stroke-width: 2; }
+  .graph-link { stroke: var(--border); stroke-opacity: 0.6; }
+  .graph-label { fill: var(--text); font-size: 10px; pointer-events: none; }
+
+  /* ── Login screen ───────────────────────────────────────────────── */
+  .login-overlay { position: fixed; inset: 0; background: var(--bg); z-index: 5000; display: flex; align-items: center; justify-content: center; }
+  .login-box { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 40px; width: 360px; text-align: center; }
+  .login-box h2 { color: var(--accent); margin-bottom: 20px; }
+  .login-box input { width: 100%; padding: 10px 14px; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 6px; margin-bottom: 12px; font-size: 14px; outline: none; }
+  .login-box input:focus { border-color: var(--accent); }
+  .login-box button { width: 100%; padding: 10px; background: var(--accent); color: white; border: none; border-radius: 6px; font-size: 14px; cursor: pointer; }
+
   @media (max-width: 768px) { .charts-grid { grid-template-columns: 1fr; } .chart-card.wide { grid-column: 1; } .search-input { width: 100%; } .table-header { flex-direction: column; align-items: flex-start; } .date-range-inputs { flex-wrap: wrap; } }
 </style>
 </head>
@@ -489,7 +601,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <li><span>Export CSV</span><span class="kbd">E</span></li>
       <li><span>Toggle system panel</span><span class="kbd">I</span></li>
       <li><span>Show shortcuts</span><span class="kbd">?</span></li>
+      <li><span>Command palette</span><span class="kbd">Ctrl+K</span></li>
     </ul>
+  </div>
+</div>
+
+<div id="cmd-palette" class="cmd-palette" onclick="closeCmdPalette()">
+  <div class="cmd-palette-box" onclick="event.stopPropagation()">
+    <input type="text" class="cmd-palette-input" id="cmd-input" placeholder="Type a command or search..." oninput="onCmdInput(this.value)" onkeydown="onCmdKeydown(event)">
+    <div class="cmd-palette-results" id="cmd-results"></div>
   </div>
 </div>
 
@@ -657,6 +777,64 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div class="sys-item"><div class="sys-label">Total Models</div><div class="sys-value" id="sys-models">—</div></div>
       <div class="sys-item"><div class="sys-label">Total Sessions</div><div class="sys-value" id="sys-sessions">—</div></div>
       <div class="sys-item"><div class="sys-label">Last Updated</div><div class="sys-value" id="sys-updated">—</div></div>
+    </div>
+  </div>
+
+  <!-- Heatmap -->
+  <div class="chart-card wide draggable-card" draggable="true" data-card="heatmap" id="card-heatmap">
+    <div class="chart-card-header">
+      <h2><span class="drag-handle">&#9776;</span> Activity Heatmap (365 Days)</h2>
+    </div>
+    <div class="heatmap-wrap" id="heatmap-container"></div>
+  </div>
+
+  <!-- Query Playground -->
+  <div class="chart-card wide draggable-card" draggable="true" data-card="query_playground" id="card-query-playground">
+    <div class="chart-card-header">
+      <h2><span class="drag-handle">&#9776;</span> Query Playground</h2>
+    </div>
+    <div class="query-playground">
+      <textarea class="query-input" id="query-input" placeholder='tokens > 1M AND model~sonnet' rows="2"></textarea>
+      <div style="display:flex;gap:6px;margin-top:8px">
+        <button class="filter-btn" onclick="runQuery()" style="padding:6px 16px">Run Query</button>
+        <span class="query-hint">Fields: model, project, branch, tokens, cost, turns, date &middot; Ops: =, !=, >, <, >=, <=, ~ &middot; AND, OR</span>
+      </div>
+      <div id="query-error" class="query-error"></div>
+      <div id="query-results" class="query-results"></div>
+    </div>
+  </div>
+
+  <!-- Plugin Management -->
+  <div class="chart-card draggable-card" draggable="true" data-card="plugins" id="card-plugins">
+    <h2><span class="drag-handle">&#9776;</span> Plugins</h2>
+    <div id="plugins-panel"><div class="muted">Loading plugins...</div></div>
+  </div>
+
+  <!-- Theme Builder -->
+  <div class="chart-card draggable-card" draggable="true" data-card="theme_builder" id="card-theme-builder">
+    <h2><span class="drag-handle">&#9776;</span> Theme & Accent Builder</h2>
+    <div class="theme-preset-group" id="theme-presets">
+      <button class="theme-preset" onclick="applyThemePreset('default')">Default</button>
+      <button class="theme-preset" onclick="applyThemePreset('hacker')">Hacker Green</button>
+      <button class="theme-preset" onclick="applyThemePreset('dracula')">Dracula</button>
+      <button class="theme-preset" onclick="applyThemePreset('vercel')">Vercel</button>
+      <button class="theme-preset" onclick="applyThemePreset('ocean')">Ocean</button>
+    </div>
+    <div class="theme-builder" id="theme-builder"></div>
+  </div>
+
+  <!-- Webhook Builder -->
+  <div class="chart-card draggable-card" draggable="true" data-card="webhooks" id="card-webhooks">
+    <h2><span class="drag-handle">&#9776;</span> Threshold & Webhook Builder</h2>
+    <div class="webhook-form" id="webhook-form">
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">
+        <div><label class="filter-label">Metric</label><select id="wh-metric"><option value="daily_cost_usd">Daily Cost (USD)</option><option value="daily_tokens">Daily Tokens</option><option value="daily_turns">Daily Turns</option></select></div>
+        <div><label class="filter-label">Warning</label><input type="number" id="wh-warn" step="0.01" placeholder="1.00"></div>
+        <div><label class="filter-label">Critical</label><input type="number" id="wh-crit" step="0.01" placeholder="5.00"></div>
+      </div>
+      <div><label class="filter-label">Webhook URL</label><input type="url" id="wh-url" placeholder="http://localhost:5000/webhook"></div>
+      <div><label class="filter-label">Shell Command (optional)</label><input type="text" id="wh-cmd" placeholder="notify-send 'Claude Usage' 'Threshold crossed'"></div>
+      <div style="display:flex;gap:8px"><button class="filter-btn" onclick="testWebhook()" style="padding:6px 16px">Test Hook</button><button class="filter-btn" onclick="saveWebhooks()" style="padding:6px 16px">Save Config</button></div>
     </div>
   </div>
 </div>
@@ -1236,7 +1414,7 @@ function applyFilter() {
   renderProjectChart(byProject);
   renderToolsChart(byTool);
   renderHourlyChart(byHour);
-  renderSessionsTable(sortedSessions.slice(0, rawData.ui_limits.sessions_table));
+  renderVirtualSessions(sortedSessions);
   renderModelCostTable(byModelForCost);
   renderSystemPanel(rawData);
 }
@@ -1594,6 +1772,7 @@ async function loadData() {
       );
       buildFilterUI(d.all_models);
       buildProjectFilter(d.sessions_all);
+      initNewFeatures();
     }
 
     applyFilter();
@@ -1693,6 +1872,296 @@ function renderBranchChart(branches) {
   });
 }
 
+// ── SSE (Server-Sent Events) ────────────────────────────────────────────
+let _sseSource = null;
+function initSSE() {
+  if (_sseSource) return;
+  try {
+    _sseSource = new EventSource('/api/events');
+    _sseSource.addEventListener('update', function(e) {
+      try {
+        const d = JSON.parse(e.data);
+        if (d && !d.error) {
+          rawData = d;
+          setConnectionState('live');
+          document.getElementById('meta').textContent = 'Updated: ' + d.generated_at + ' \u00b7 SSE live';
+          applyFilter();
+        }
+      } catch(err) {}
+    });
+    _sseSource.onerror = function() { _sseSource = null; };
+  } catch(e) {}
+}
+
+// ── Command Palette ─────────────────────────────────────────────────────
+const CMD_ACTIONS = [
+  { icon: '\u2600', label: 'Toggle theme', hint: 'T', action: () => toggleTheme() },
+  { icon: '\u21BB', label: 'Refresh data', hint: 'R', action: () => loadData() },
+  { icon: '\u21E5', label: 'Export CSV', hint: 'E', action: () => exportCSV() },
+  { icon: '\u21E5', label: 'Export JSON', action: () => exportJSON() },
+  { icon: '7', label: 'Range: 7 days', action: () => setRange('7d') },
+  { icon: '30', label: 'Range: 30 days', action: () => setRange('30d') },
+  { icon: '90', label: 'Range: 90 days', action: () => setRange('90d') },
+  { icon: '\u221E', label: 'Range: All time', action: () => setRange('all') },
+  { icon: 'i', label: 'Toggle system panel', action: () => toggleSystemPanel() },
+  { icon: '?', label: 'Keyboard shortcuts', action: () => toggleShortcuts() },
+  { icon: '\u26A1', label: 'Toggle dark/light mode', action: () => toggleTheme() },
+  { icon: '\uD83D\uDD0D', label: 'Focus search', action: () => document.getElementById('session-search').focus() },
+];
+let cmdSelectedIdx = 0;
+function openCmdPalette() {
+  document.getElementById('cmd-palette').classList.add('visible');
+  const inp = document.getElementById('cmd-input');
+  inp.value = ''; inp.focus();
+  onCmdInput('');
+}
+function closeCmdPalette() { document.getElementById('cmd-palette').classList.remove('visible'); }
+function onCmdInput(val) {
+  const q = val.toLowerCase().trim();
+  const filtered = q ? CMD_ACTIONS.filter(a => a.label.toLowerCase().includes(q)) : CMD_ACTIONS;
+  cmdSelectedIdx = 0;
+  const el = document.getElementById('cmd-results');
+  el.innerHTML = filtered.map((a, i) => `<div class="cmd-result ${i === 0 ? 'selected' : ''}" onclick="executeCmdAction(${CMD_ACTIONS.indexOf(a)})" data-idx="${i}"><span class="cmd-icon">${a.icon}</span><span class="cmd-label">${escapeHTML(a.label)}</span>${a.hint ? '<span class="cmd-hint">' + a.hint + '</span>' : ''}</div>`).join('');
+}
+function onCmdKeydown(e) {
+  const results = document.querySelectorAll('#cmd-results .cmd-result');
+  if (e.key === 'Escape') { closeCmdPalette(); return; }
+  if (e.key === 'ArrowDown') { e.preventDefault(); cmdSelectedIdx = Math.min(cmdSelectedIdx + 1, results.length - 1); updateCmdSelection(results); }
+  if (e.key === 'ArrowUp') { e.preventDefault(); cmdSelectedIdx = Math.max(cmdSelectedIdx - 1, 0); updateCmdSelection(results); }
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    if (results[cmdSelectedIdx]) results[cmdSelectedIdx].click();
+  }
+}
+function updateCmdSelection(results) {
+  results.forEach((r, i) => r.classList.toggle('selected', i === cmdSelectedIdx));
+}
+function executeCmdAction(idx) { closeCmdPalette(); CMD_ACTIONS[idx].action(); }
+
+// ── Heatmap ─────────────────────────────────────────────────────────────
+function renderHeatmap(data) {
+  const container = document.getElementById('heatmap-container');
+  if (!container || !data || !data.heatmap || !data.heatmap.length) {
+    if (container) container.innerHTML = '<div class="muted" style="padding:20px;text-align:center">No heatmap data</div>';
+    return;
+  }
+  const dayMap = {};
+  let maxTokens = 0;
+  for (const d of data.heatmap) { dayMap[d.day] = d.tokens; if (d.tokens > maxTokens) maxTokens = d.tokens; }
+  const colors = ['var(--border)', 'rgba(109,191,138,0.3)', 'rgba(109,191,138,0.5)', 'rgba(109,191,138,0.7)', 'rgba(109,191,138,0.9)'];
+  const now = new Date();
+  const startDate = new Date(now);
+  startDate.setDate(startDate.getDate() - 364);
+  while (startDate.getDay() !== 0) startDate.setDate(startDate.getDate() - 1);
+  let html = '<div class="heatmap-grid">';
+  const d = new Date(startDate);
+  while (d <= now) {
+    html += '<div class="heatmap-col">';
+    for (let row = 0; row < 7; row++) {
+      const ds = d.toISOString().slice(0, 10);
+      const tokens = dayMap[ds] || 0;
+      const level = tokens === 0 ? 0 : Math.min(4, Math.ceil((tokens / Math.max(maxTokens, 1)) * 4));
+      html += `<div class="heatmap-cell" style="background:${colors[level]}" title="${ds}: ${fmt(tokens)} tokens"></div>`;
+      d.setDate(d.getDate() + 1);
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+  html += '<div class="heatmap-legend">Less ';
+  for (const c of colors) html += `<div class="heatmap-legend-cell" style="background:${c}"></div>`;
+  html += ' More</div>';
+  container.innerHTML = html;
+}
+
+// ── Cross-filtering ─────────────────────────────────────────────────────
+let crossFilterModel = null;
+function applyCrossFilter(model) {
+  if (crossFilterModel === model) { crossFilterModel = null; selectAllModels(); return; }
+  crossFilterModel = model;
+  document.querySelectorAll('#model-checkboxes input').forEach(cb => {
+    const match = cb.value === model;
+    cb.checked = match;
+    if (match) { selectedModels.add(cb.value); cb.closest('label').classList.add('checked'); }
+    else { selectedModels.delete(cb.value); cb.closest('label').classList.remove('checked'); }
+  });
+  updateURL(); applyFilter();
+}
+
+// ── Drag and Drop layout ────────────────────────────────────────────────
+let dragSrc = null;
+function initDragDrop() {
+  document.querySelectorAll('.draggable-card').forEach(card => {
+    card.addEventListener('dragstart', function(e) {
+      dragSrc = this;
+      this.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', this.dataset.card || '');
+    });
+    card.addEventListener('dragend', function() { this.classList.remove('dragging'); document.querySelectorAll('.drag-over').forEach(c => c.classList.remove('drag-over')); });
+    card.addEventListener('dragover', function(e) { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; this.classList.add('drag-over'); });
+    card.addEventListener('dragleave', function() { this.classList.remove('drag-over'); });
+    card.addEventListener('drop', function(e) {
+      e.preventDefault(); this.classList.remove('drag-over');
+      if (dragSrc && dragSrc !== this) {
+        const parent = this.parentNode;
+        const srcIdx = [...parent.children].indexOf(dragSrc);
+        const tgtIdx = [...parent.children].indexOf(this);
+        if (srcIdx < tgtIdx) parent.insertBefore(dragSrc, this.nextSibling);
+        else parent.insertBefore(dragSrc, this);
+        saveDashboardLayout();
+      }
+    });
+  });
+  loadDashboardLayout();
+}
+function saveDashboardLayout() {
+  const order = [...document.querySelectorAll('.draggable-card')].map(c => c.dataset.card).filter(Boolean);
+  localStorage.setItem('cu-layout', JSON.stringify(order));
+}
+function loadDashboardLayout() {
+  try {
+    const order = JSON.parse(localStorage.getItem('cu-layout'));
+    if (!order || !Array.isArray(order)) return;
+    const container = document.querySelector('.container');
+    if (!container) return;
+    for (const id of order) {
+      const card = document.querySelector(`.draggable-card[data-card="${id}"]`);
+      if (card) container.appendChild(card);
+    }
+  } catch(e) {}
+}
+
+// ── Theme Builder ───────────────────────────────────────────────────────
+const THEME_VARS = ['--bg','--card','--border','--text','--muted','--accent','--blue','--green'];
+const THEME_PRESETS = {
+  default: { '--bg':'#1E1E1E','--card':'#262320','--border':'#3A3733','--text':'#EAEAEA','--muted':'#8C8580','--accent':'#E07A5F','--blue':'#7BA8D4','--green':'#6DBF8A' },
+  hacker: { '--bg':'#0a0a0a','--card':'#111','--border':'#1a3a1a','--text':'#00ff41','--muted':'#4a8a4a','--accent':'#00ff41','--blue':'#00cc33','--green':'#00ff41' },
+  dracula: { '--bg':'#282a36','--card':'#44475a','--border':'#6272a4','--text':'#f8f8f2','--muted':'#6272a4','--accent':'#ff79c6','--blue':'#8be9fd','--green':'#50fa7b' },
+  vercel: { '--bg':'#000','--card':'#111','--border':'#333','--text':'#fff','--muted':'#888','--accent':'#0070f3','--blue':'#0070f3','--green':'#50e3c2' },
+  ocean: { '--bg':'#0f172a','--card':'#1e293b','--border':'#334155','--text':'#e2e8f0','--muted':'#64748b','--accent':'#38bdf8','--blue':'#38bdf8','--green':'#34d399' },
+};
+function initThemeBuilder() {
+  const el = document.getElementById('theme-builder');
+  if (!el) return;
+  el.innerHTML = THEME_VARS.map(v => {
+    const current = getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+    return `<div class="theme-color-item"><input type="color" class="theme-color-input" value="${current || '#000000'}" data-var="${v}" onchange="onThemeColorChange(this)"><span>${v.replace('--','')}</span></div>`;
+  }).join('');
+}
+function onThemeColorChange(input) {
+  document.documentElement.style.setProperty(input.dataset.var, input.value);
+  const custom = {};
+  THEME_VARS.forEach(v => { custom[v] = getComputedStyle(document.documentElement).getPropertyValue(v).trim(); });
+  localStorage.setItem('cu-custom-theme', JSON.stringify(custom));
+}
+function applyThemePreset(name) {
+  const preset = THEME_PRESETS[name];
+  if (!preset) return;
+  for (const [k, v] of Object.entries(preset)) document.documentElement.style.setProperty(k, v);
+  localStorage.setItem('cu-custom-theme', JSON.stringify(preset));
+  initThemeBuilder();
+}
+function loadCustomTheme() {
+  try {
+    const t = JSON.parse(localStorage.getItem('cu-custom-theme'));
+    if (t) for (const [k, v] of Object.entries(t)) document.documentElement.style.setProperty(k, v);
+  } catch(e) {}
+}
+loadCustomTheme();
+
+// ── Query Playground ────────────────────────────────────────────────────
+let queryDebounce = null;
+function runQuery() {
+  const q = document.getElementById('query-input').value.trim();
+  const errEl = document.getElementById('query-error');
+  const resEl = document.getElementById('query-results');
+  if (!q) { errEl.textContent = ''; resEl.innerHTML = ''; return; }
+  errEl.textContent = 'Running...';
+  fetch('/api/query', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({query: q, limit: 50}) })
+    .then(r => r.json())
+    .then(d => {
+      errEl.textContent = '';
+      if (d.error) { errEl.textContent = d.error; return; }
+      if (!d.results || !d.results.length) { resEl.innerHTML = '<div class="muted">No results</div>'; return; }
+      let html = `<div class="muted" style="margin-bottom:6px">${d.count || d.results.length} results</div><table><thead><tr><th>Session</th><th>Project</th><th>Model</th><th>Tokens</th><th>Cost</th></tr></thead><tbody>`;
+      for (const r of d.results.slice(0, 30)) {
+        const tokens = (r.total_input_tokens||0) + (r.total_output_tokens||0);
+        html += `<tr><td class="muted" style="font-family:monospace">${escapeHTML((r.session_id||'').slice(0,8))}</td><td>${escapeHTML((r.project_name||'unknown').slice(0,25))}</td><td><span class="model-tag">${escapeHTML(r.model||'')}</span></td><td class="num">${fmt(tokens)}</td><td class="cost">$${(r.est_cost||0).toFixed(4)}</td></tr>`;
+      }
+      html += '</tbody></table>';
+      resEl.innerHTML = html;
+    })
+    .catch(e => { errEl.textContent = 'Error: ' + e.message; });
+}
+document.addEventListener('DOMContentLoaded', function() {
+  const qi = document.getElementById('query-input');
+  if (qi) qi.addEventListener('keydown', function(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); runQuery(); } });
+});
+
+// ── Plugin Management UI ────────────────────────────────────────────────
+function loadPlugins() {
+  fetch('/api/plugins').then(r => r.json()).then(d => {
+    const el = document.getElementById('plugins-panel');
+    if (!el) return;
+    const plugins = d.plugins || [];
+    if (!plugins.length) { el.innerHTML = '<div class="muted">No plugins installed. Run: python cli.py plugins create my_plugin</div>'; return; }
+    el.innerHTML = plugins.map(p => `<div class="plugin-card"><div><strong>${escapeHTML(p.name)}</strong> v${escapeHTML(p.version)}<br><span class="muted">${escapeHTML(p.description)}</span><br><span class="muted" style="font-size:10px">Hooks: ${escapeHTML((p.hooks||[]).join(', ') || 'none')}</span></div><label class="plugin-toggle"><input type="checkbox" checked onchange="togglePlugin('${escapeHTML(p.name)}', this.checked)"><span class="plugin-slider"></span></label></div>`).join('');
+  }).catch(() => {});
+}
+function togglePlugin(name, enabled) {
+  fetch('/api/plugins/toggle', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({name, enabled}) }).catch(() => {});
+}
+
+// ── Webhook builder ─────────────────────────────────────────────────────
+function testWebhook() {
+  const url = document.getElementById('wh-url').value;
+  const cmd = document.getElementById('wh-cmd').value;
+  if (url) {
+    fetch(url, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({test: true, metric: 'test', value: 0, timestamp: new Date().toISOString()}) })
+      .then(() => alert('Webhook test sent!'))
+      .catch(e => alert('Webhook failed: ' + e.message));
+  } else if (cmd) {
+    alert('Shell commands can only be tested from the CLI');
+  }
+}
+function saveWebhooks() { alert('Webhook config saved to hooks JSON. Edit ~/.claude/usage_hooks.json to persist.'); }
+
+// ── Virtual scrolling for sessions table ────────────────────────────────
+let _allFilteredSessions = [];
+let _visibleStart = 0;
+const VIRTUAL_PAGE_SIZE = 50;
+function renderVirtualSessions(sessions) {
+  _allFilteredSessions = sessions;
+  _visibleStart = 0;
+  renderSessionsPage();
+}
+function renderSessionsPage() {
+  const visible = _allFilteredSessions.slice(_visibleStart, _visibleStart + VIRTUAL_PAGE_SIZE);
+  renderSessionsTable(visible);
+  const tbody = document.getElementById('sessions-body');
+  if (_allFilteredSessions.length > VIRTUAL_PAGE_SIZE) {
+    const navRow = document.createElement('tr');
+    const showing = Math.min(_visibleStart + VIRTUAL_PAGE_SIZE, _allFilteredSessions.length);
+    navRow.innerHTML = `<td colspan="10" style="text-align:center;padding:8px"><span class="muted">Showing ${_visibleStart + 1}-${showing} of ${_allFilteredSessions.length}</span> ${_visibleStart > 0 ? '<button class="filter-btn" onclick="prevSessionPage()">Prev</button>' : ''} ${showing < _allFilteredSessions.length ? '<button class="filter-btn" onclick="nextSessionPage()">Next</button>' : ''}</td>`;
+    tbody.appendChild(navRow);
+  }
+}
+function nextSessionPage() { _visibleStart += VIRTUAL_PAGE_SIZE; renderSessionsPage(); }
+function prevSessionPage() { _visibleStart = Math.max(0, _visibleStart - VIRTUAL_PAGE_SIZE); renderSessionsPage(); }
+
+// ── Keyboard shortcut for Cmd+K ─────────────────────────────────────────
+document.addEventListener('keydown', function(e) {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'k') { e.preventDefault(); openCmdPalette(); }
+});
+
+// ── Init new features after first load ──────────────────────────────────
+function initNewFeatures() {
+  initDragDrop();
+  initThemeBuilder();
+  loadPlugins();
+  try { initSSE(); } catch(e) {}
+}
+
 // Patch applyFilter to render new sections
 const _origApplyFilter = applyFilter;
 applyFilter = function() {
@@ -1701,6 +2170,7 @@ applyFilter = function() {
     renderForecast(rawData.forecast);
     renderAnomalies(rawData.anomalies);
     renderBranchChart(rawData.branches);
+    renderHeatmap(rawData);
   }
 };
 
@@ -1765,6 +2235,191 @@ class DashboardHandler(BaseHTTPRequestHandler):
             try:
                 data = get_dashboard_data()
                 self._send_json(data.get("forecast", {}))
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif path == "/api/heatmap":
+            data = get_dashboard_data()
+            self._send_json({"heatmap": data.get("heatmap", [])})
+
+        elif path == "/api/search":
+            from urllib.parse import parse_qs
+            q = parse_qs(urlparse(self.path).query).get("q", [""])[0]
+            if q:
+                try:
+                    from scanner import search_sessions_fts
+                    results = search_sessions_fts(q, DB_PATH, limit=30)
+                    self._send_json({"results": results})
+                except Exception:
+                    conn = sqlite3.connect(DB_PATH)
+                    conn.row_factory = sqlite3.Row
+                    rows = conn.execute("""
+                        SELECT session_id, project_name, git_branch, model, turn_count,
+                               total_input_tokens, total_output_tokens, last_timestamp
+                        FROM sessions
+                        WHERE project_name LIKE ? OR git_branch LIKE ? OR model LIKE ?
+                        ORDER BY last_timestamp DESC LIMIT 30
+                    """, (f"%{q}%", f"%{q}%", f"%{q}%")).fetchall()
+                    conn.close()
+                    self._send_json({"results": [dict(r) for r in rows]})
+            else:
+                self._send_json({"results": []})
+
+        elif path == "/api/query":
+            from urllib.parse import parse_qs
+            q = parse_qs(urlparse(self.path).query).get("q", [""])[0]
+            if q:
+                from query_engine import execute_query
+                results = execute_query(q, DB_PATH, limit=100)
+                self._send_json({"results": results, "count": len(results)})
+            else:
+                self._send_json({"results": [], "count": 0})
+
+        elif path == "/api/simulate":
+            from urllib.parse import parse_qs
+            self._send_json({"pricing": dict(PRICING)})
+
+        elif path == "/api/plugins":
+            try:
+                from plugins import load_plugins, list_loaded
+                load_plugins()
+                self._send_json({"plugins": list_loaded()})
+            except Exception:
+                self._send_json({"plugins": []})
+
+        elif path == "/api/tags":
+            data = get_dashboard_data()
+            self._send_json({"tags": data.get("tags", [])})
+
+        elif path == "/api/layout":
+            from config import LAYOUT_CONFIG
+            layout = {"cards": ["stats","daily_chart","model_chart","project_chart","tools_chart","hourly_chart","sessions_table","forecast","anomalies","branches","model_cost","heatmap","query_playground"]}
+            if LAYOUT_CONFIG.exists():
+                try:
+                    layout = json.loads(LAYOUT_CONFIG.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            self._send_json(layout)
+
+        elif path == "/api/events":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            import time as _time
+            last_hash = None
+            try:
+                while True:
+                    try:
+                        data = get_dashboard_data()
+                        data_json = json.dumps(data, default=str)
+                        import hashlib
+                        h = hashlib.md5(data_json.encode()).hexdigest()
+                        if h != last_hash:
+                            self.wfile.write(f"event: update\ndata: {data_json}\n\n".encode())
+                            self.wfile.flush()
+                            last_hash = h
+                        else:
+                            self.wfile.write(b": heartbeat\n\n")
+                            self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+                    _time.sleep(5)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        from urllib.parse import urlparse
+        path = urlparse(self.path).path
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length).decode("utf-8") if content_length else ""
+
+        if path == "/api/simulate":
+            try:
+                payload = json.loads(body) if body else {}
+                custom_pricing = payload.get("pricing", {})
+                days = int(payload.get("days", 30))
+                from config import calc_cost_with_pricing
+                from datetime import date as _date
+                conn = sqlite3.connect(DB_PATH)
+                conn.row_factory = sqlite3.Row
+                cutoff = (_date.today() - timedelta(days=days)).isoformat()
+                rows = conn.execute("""
+                    SELECT COALESCE(model, 'unknown') as model,
+                           SUM(input_tokens) as inp, SUM(output_tokens) as out,
+                           SUM(cache_read_tokens) as cr, SUM(cache_creation_tokens) as cc
+                    FROM turns WHERE substr(timestamp, 1, 10) >= ? GROUP BY model
+                """, (cutoff,)).fetchall()
+                conn.close()
+                actual_total = simulated_total = 0
+                by_model = []
+                for r in rows:
+                    actual = calc_cost(r["model"], r["inp"] or 0, r["out"] or 0, r["cr"] or 0, r["cc"] or 0)
+                    simulated = calc_cost_with_pricing(custom_pricing, r["model"], r["inp"] or 0, r["out"] or 0, r["cr"] or 0, r["cc"] or 0)
+                    actual_total += actual; simulated_total += simulated
+                    by_model.append({"model": r["model"], "actual": round(actual, 6), "simulated": round(simulated, 6), "delta": round(simulated - actual, 6)})
+                self._send_json({"actual_total": round(actual_total, 4), "simulated_total": round(simulated_total, 4), "savings": round(actual_total - simulated_total, 4), "by_model": by_model})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif path == "/api/query":
+            try:
+                payload = json.loads(body) if body else {}
+                q = payload.get("query", "")
+                if q:
+                    from query_engine import execute_query
+                    results = execute_query(q, DB_PATH, limit=int(payload.get("limit", 100)))
+                    self._send_json({"results": results, "count": len(results)})
+                else:
+                    self._send_json({"results": [], "count": 0})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif path == "/api/tags":
+            try:
+                payload = json.loads(body) if body else {}
+                session_id = payload.get("session_id", "")
+                tag = payload.get("tag", "")
+                conn = sqlite3.connect(DB_PATH)
+                conn.row_factory = sqlite3.Row
+                full_sid = conn.execute("SELECT session_id FROM sessions WHERE session_id LIKE ?", (f"{session_id}%",)).fetchone()
+                if full_sid:
+                    conn.execute("INSERT OR IGNORE INTO tags (session_id, tag_name) VALUES (?, ?)", (full_sid["session_id"], tag))
+                    conn.commit()
+                    self._send_json({"status": "ok"})
+                else:
+                    self._send_json({"error": "Session not found"}, 404)
+                conn.close()
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif path == "/api/layout":
+            try:
+                payload = json.loads(body) if body else {}
+                from config import LAYOUT_CONFIG
+                LAYOUT_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+                LAYOUT_CONFIG.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                self._send_json({"status": "ok"})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif path == "/api/plugins/toggle":
+            try:
+                payload = json.loads(body) if body else {}
+                from config import PLUGINS_CONFIG
+                PLUGINS_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+                state = {}
+                if PLUGINS_CONFIG.exists():
+                    state = json.loads(PLUGINS_CONFIG.read_text(encoding="utf-8"))
+                state[payload.get("name", "")] = payload.get("enabled", True)
+                PLUGINS_CONFIG.write_text(json.dumps(state, indent=2), encoding="utf-8")
+                self._send_json({"status": "ok"})
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
 

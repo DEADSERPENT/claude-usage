@@ -49,7 +49,8 @@ def detect_anomalies(db_path: Path = DB_PATH, window_days: int = None,
     today_str = date.today().isoformat()
     window_start = (date.today() - timedelta(days=window_days)).isoformat()
 
-    # Get daily aggregates for the baseline window (excluding today)
+    # Get daily aggregates for the baseline window (excluding today).
+    # Group by (day, model) so cost is computed per-model then summed per day.
     daily_rows = conn.execute("""
         SELECT substr(timestamp, 1, 10) as day,
                SUM(input_tokens + output_tokens) as total_tokens,
@@ -60,6 +61,16 @@ def detect_anomalies(db_path: Path = DB_PATH, window_days: int = None,
         FROM turns
         WHERE substr(timestamp, 1, 10) >= ? AND substr(timestamp, 1, 10) < ?
         GROUP BY day ORDER BY day
+    """, (window_start, today_str)).fetchall()
+
+    daily_model_rows = conn.execute("""
+        SELECT substr(timestamp, 1, 10) as day,
+               COALESCE(model, 'unknown') as model,
+               SUM(input_tokens) as inp, SUM(output_tokens) as out,
+               SUM(cache_read_tokens) as cr, SUM(cache_creation_tokens) as cc
+        FROM turns
+        WHERE substr(timestamp, 1, 10) >= ? AND substr(timestamp, 1, 10) < ?
+        GROUP BY day, model ORDER BY day
     """, (window_start, today_str)).fetchall()
 
     # Get today's aggregates
@@ -127,12 +138,14 @@ def detect_anomalies(db_path: Path = DB_PATH, window_days: int = None,
 
     # ── Daily cost anomaly ────────────────────────────────────────────────────
     if daily_rows and today_cost_rows:
-        baseline_costs = []
-        for r in daily_rows:
-            # Rough cost estimate using default pricing for baseline
-            cost = calc_cost("default", r["inp"] or 0, r["out"] or 0,
-                             r["cr"] or 0, r["cc"] or 0)
-            baseline_costs.append(cost)
+        from collections import defaultdict
+        daily_cost_totals = defaultdict(float)
+        for r in daily_model_rows:
+            daily_cost_totals[r["day"]] += calc_cost(
+                r["model"], r["inp"] or 0, r["out"] or 0,
+                r["cr"] or 0, r["cc"] or 0)
+        baseline_costs = [daily_cost_totals[r["day"]] for r in daily_rows
+                          if r["day"] in daily_cost_totals]
 
         today_cost = sum(
             calc_cost(r["model"], r["inp"] or 0, r["out"] or 0,

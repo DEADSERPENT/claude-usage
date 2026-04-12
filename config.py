@@ -98,3 +98,56 @@ def calc_cost(model: str | None, inp: int, out: int, cache_read: int, cache_crea
         cache_read * p.get("cache_read", 0) / 1_000_000 +
         cache_creation * p.get("cache_write", 0) / 1_000_000
     )
+
+
+# ── Migrations / sync / layout / plugins state ────────────────────────────────
+MIGRATIONS_DIR = Path(
+    os.environ.get("CLAUDE_USAGE_MIGRATIONS_DIR", str(CLAUDE_DIR / "usage_migrations"))
+)
+SYNC_DIR = Path(os.environ.get("CLAUDE_USAGE_SYNC_DIR", str(CLAUDE_DIR / "usage_sync")))
+LAYOUT_CONFIG = Path(
+    os.environ.get("CLAUDE_USAGE_LAYOUT", str(CLAUDE_DIR / "usage_layout.json"))
+)
+PLUGINS_CONFIG = Path(
+    os.environ.get("CLAUDE_USAGE_PLUGINS_CONFIG", str(CLAUDE_DIR / "usage_plugins.json"))
+)
+
+# ── Webhooks / circuit breaker / retention / auth / search / SSE / tags ──────
+WEBHOOKS_ENABLED = os.environ.get("CLAUDE_USAGE_WEBHOOKS", "0") == "1"
+CIRCUIT_BREAKER_ENABLED = os.environ.get("CLAUDE_USAGE_CIRCUIT_BREAKER", "0") == "1"
+CIRCUIT_BREAKER_ACTION = os.environ.get("CLAUDE_USAGE_CIRCUIT_BREAKER_ACTION", "warn")
+RETENTION_DAYS = int(os.environ.get("CLAUDE_USAGE_RETENTION_DAYS", "90"))
+AUTH_SECRET_FILE = Path(
+    os.environ.get("CLAUDE_USAGE_AUTH_SECRET", str(CLAUDE_DIR / "usage_auth_secret"))
+)
+FTS_ENABLED = os.environ.get("CLAUDE_USAGE_FTS", "1") == "1"
+SSE_ENABLED = os.environ.get("CLAUDE_USAGE_SSE", "1") == "1"
+TAGS_FILE = Path(os.environ.get("CLAUDE_USAGE_TAGS", str(CLAUDE_DIR / "usage_tags.json")))
+
+
+def calc_cost_with_pricing(
+    pricing_override: dict, model: str, inp: int, out: int, cache_read: int, cache_creation: int
+) -> float:
+    """Calculate cost with custom pricing (for what-if simulator)."""
+    p = pricing_override.get(model)
+    if p is None:
+        for key in pricing_override:
+            if key != "default" and model and model.startswith(key):
+                p = pricing_override[key]
+                break
+    if p is None:
+        ml = (model or "").lower()
+        if "opus" in ml:
+            p = pricing_override.get("claude-opus-4-6", pricing_override.get("default", {}))
+        elif "sonnet" in ml:
+            p = pricing_override.get("claude-sonnet-4-6", pricing_override.get("default", {}))
+        elif "haiku" in ml:
+            p = pricing_override.get("claude-haiku-4-5", pricing_override.get("default", {}))
+    if p is None:
+        p = pricing_override.get("default", {})
+    return (
+        inp * p.get("input", 0) / 1_000_000
+        + out * p.get("output", 0) / 1_000_000
+        + cache_read * p.get("cache_read", 0) / 1_000_000
+        + cache_creation * p.get("cache_write", 0) / 1_000_000
+    )
