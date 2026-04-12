@@ -2190,7 +2190,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
 
@@ -2306,7 +2305,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "keep-alive")
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             import time as _time
             last_hash = None

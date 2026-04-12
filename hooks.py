@@ -34,8 +34,10 @@ Shell commands and webhooks fire once per threshold crossing per day.  A thresho
 """
 
 import json
+import shlex
 import sqlite3
 import subprocess
+import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -77,10 +79,18 @@ def _today_stats(db_path: Path) -> dict:
 
 
 def _fire(command: str) -> None:
-    """Execute a shell command silently in the background."""
+    """Execute a notification command silently in the background.
+
+    On Windows, uses cmd /c since shlex.split follows POSIX rules.
+    On Unix, splits the command into an argv list to avoid shell=True.
+    """
     try:
+        if sys.platform == "win32":
+            args = ["cmd", "/c", command]
+        else:
+            args = shlex.split(command)
         subprocess.Popen(
-            command, shell=True,
+            args,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )

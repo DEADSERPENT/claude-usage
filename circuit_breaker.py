@@ -78,7 +78,7 @@ def _get_today_cost(db_path: Path = DB_PATH) -> float:
 
 
 def _find_claude_processes() -> list[int]:
-    """Find running Claude Code process PIDs."""
+    """Find running Claude Code process PIDs (exact binary match only)."""
     pids = []
     if sys.platform == "win32":
         try:
@@ -100,7 +100,13 @@ def _find_claude_processes() -> list[int]:
     else:
         try:
             import subprocess
-            result = subprocess.run(["pgrep", "-f", "claude"], capture_output=True, text=True)
+            # Match exact binary name, not substring. pgrep -x matches the
+            # process name exactly (not the full command line like -f does),
+            # preventing accidental kills of unrelated processes.
+            result = subprocess.run(
+                ["pgrep", "-x", "claude"],
+                capture_output=True, text=True
+            )
             for line in result.stdout.strip().split("\n"):
                 if line.strip():
                     try:

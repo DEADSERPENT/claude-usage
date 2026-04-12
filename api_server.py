@@ -59,6 +59,41 @@ def _get_conn():
     return conn
 
 
+_ALLOWED_ORIGINS = {
+    "http://localhost", "http://127.0.0.1",
+    f"http://localhost:{API_PORT}", f"http://127.0.0.1:{API_PORT}",
+}
+
+
+def _safe_origin(handler) -> str:
+    """Return the request Origin only if it's a trusted localhost origin."""
+    origin = handler.headers.get("Origin", "")
+    if not origin:
+        return ""
+    normalized = origin.rstrip("/")
+    if normalized in _ALLOWED_ORIGINS:
+        return normalized
+    for prefix in ("http://localhost:", "http://127.0.0.1:"):
+        if normalized.startswith(prefix):
+            return normalized
+    return ""
+
+
+def _check_auth(handler) -> bool:
+    """Validate bearer token if AUTH_SECRET_FILE contains a secret."""
+    from config import AUTH_SECRET_FILE
+    if not AUTH_SECRET_FILE.exists():
+        return True
+    try:
+        secret = AUTH_SECRET_FILE.read_text(encoding="utf-8").strip()
+    except Exception:
+        return True
+    if not secret:
+        return True
+    auth = handler.headers.get("Authorization", "")
+    return auth == f"Bearer {secret}"
+
+
 class APIHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
@@ -68,12 +103,21 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        origin = _safe_origin(self)
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
         self.end_headers()
         self.wfile.write(body)
 
     def _send_error(self, msg, status=400):
         self._send_json({"error": msg}, status)
+
+    def _require_auth(self) -> bool:
+        if not _check_auth(self):
+            self._send_error("Unauthorized", 401)
+            return False
+        return True
 
     def _params(self):
         return parse_qs(urlparse(self.path).query)
@@ -84,13 +128,19 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self):
         self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        origin = _safe_origin(self)
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.end_headers()
 
     def do_GET(self):
         path = urlparse(self.path).path.rstrip("/")
+
+        if path != "/api/v1/health" and not self._require_auth():
+            return
 
         routes = {
             "/api/v1/health":       self._health,
@@ -141,6 +191,9 @@ class APIHandler(BaseHTTPRequestHandler):
             self._send_error("Not found", 404)
 
     def do_POST(self):
+        if not self._require_auth():
+            return
+
         path = urlparse(self.path).path.rstrip("/")
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length).decode("utf-8") if content_length else ""
@@ -870,7 +923,10 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        origin = _safe_origin(self)
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
         self.end_headers()
 
         import time as _time
