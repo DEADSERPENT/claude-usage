@@ -1,8 +1,3 @@
-Here’s a **short, crisp, high-impact README** — clean, professional, and optimized for GitHub + recruiters 👇
-
----
-
-````markdown
 # Claude Usage Dashboard
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
