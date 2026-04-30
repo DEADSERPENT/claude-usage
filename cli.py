@@ -169,6 +169,17 @@ def cmd_today():
     print(f"  Cache read:       {fmt(total_cr)}")
     print(f"  Cache creation:   {fmt(total_cc)}")
     hr()
+
+    try:
+        from insights import generate_pulse, format_pulse_cli
+        pulse = generate_pulse(DB_PATH)
+        pulse_str = format_pulse_cli(pulse)
+        if pulse_str:
+            print()
+            print(pulse_str)
+    except Exception:
+        pass
+
     print()
     conn.close()
 

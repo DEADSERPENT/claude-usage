@@ -167,6 +167,7 @@ class APIHandler(BaseHTTPRequestHandler):
             "/api/v1/layout":         self._layout_get,
             "/api/v1/heatmap":        self._heatmap_data,
             "/api/v1/retention":      self._retention_status,
+            "/api/v1/pulse":          self._pulse,
             "/api/v1/events":         self._sse_events,
         }
 
@@ -775,6 +776,10 @@ class APIHandler(BaseHTTPRequestHandler):
         """).fetchall()
         conn.close()
         self._send_json({"days": [{"day": r["day"], "tokens": r["tokens"] or 0, "turns": r["turns"] or 0} for r in rows]})
+
+    def _pulse(self):
+        from insights import generate_pulse
+        self._send_json(generate_pulse(DB_PATH))
 
     def _retention_status(self):
         conn = _get_conn()

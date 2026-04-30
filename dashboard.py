@@ -316,7 +316,16 @@ def get_dashboard_data(db_path=DB_PATH):
         "heatmap": heatmap,
         "tags": tags,
         "cache_thrash_count": cache_thrash_count,
+        "pulse": _get_pulse(db_path),
     }
+
+
+def _get_pulse(db_path=DB_PATH) -> dict:
+    try:
+        from insights import generate_pulse
+        return generate_pulse(db_path)
+    except Exception:
+        return {"available": False}
 
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>

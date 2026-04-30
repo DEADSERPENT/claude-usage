@@ -652,6 +652,17 @@ def scan(projects_dir=PROJECTS_DIR, db_path=DB_PATH, verbose=True, user_id=None)
         print(f"  Turns added:   {total_turns}")
         print(f"  Sessions seen: {len(total_sessions)}")
 
+        # Show cost pulse after scan
+        try:
+            from insights import generate_pulse, format_pulse_cli
+            pulse = generate_pulse(db_path)
+            pulse_str = format_pulse_cli(pulse)
+            if pulse_str:
+                print()
+                print(pulse_str)
+        except Exception:
+            pass
+
     conn.close()
 
     # Evaluate threshold hooks after every scan (silently — never crash scanner)
