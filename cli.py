@@ -1893,6 +1893,11 @@ COMMANDS = {
 }
 
 def main():
+    # Only check for updates if running as a PyInstaller compiled binary
+    if getattr(sys, 'frozen', False):
+        import updater
+        updater.check_for_updates()
+
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
         print(USAGE)
         sys.exit(0)

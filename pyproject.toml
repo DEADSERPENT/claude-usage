@@ -54,4 +54,5 @@ py-modules = [
   "sync",
   "tui",
   "insights",
+  "updater",
 ]
