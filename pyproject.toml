@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-usage"
-version = "1.0.0"
+version = "1.0.1"
 description = "Local AI usage observability platform for Claude Code"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -34,6 +34,7 @@ Repository = "https://github.com/DEADSERPENT/claude-usage"
 
 [project.scripts]
 cu = "cli:main"
+claude-usage-mcp = "mcp_server:main"
 
 [tool.setuptools]
 py-modules = [
@@ -55,4 +56,5 @@ py-modules = [
   "tui",
   "insights",
   "updater",
+  "mcp_server",
 ]

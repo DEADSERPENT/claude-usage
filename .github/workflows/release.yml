@@ -12,14 +12,18 @@ jobs:
     permissions:
       contents: write
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             asset_name: claude-usage-linux
+            mcp_name: claude-usage-mcp-linux
           - os: macos-latest
             asset_name: claude-usage-macos
+            mcp_name: claude-usage-mcp-macos
           - os: windows-latest
             asset_name: claude-usage-windows.exe
+            mcp_name: claude-usage-mcp-windows.exe
 
     steps:
     - name: Checkout Code
@@ -34,15 +38,28 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install pyinstaller
-        # Install your project's local dependencies
         pip install -e .
 
-    - name: Build Executable with PyInstaller
-      run: pyinstaller --name ${{ matrix.asset_name }} --onefile cli.py
+    - name: Build Main Executable
+      run: >
+        pyinstaller
+        --name ${{ matrix.asset_name }}
+        --onefile
+        --add-data "mcp_server.py:."
+        cli.py
 
-    - name: Upload Binary to GitHub Release
+    - name: Build MCP Server Executable
+      run: >
+        pyinstaller
+        --name ${{ matrix.mcp_name }}
+        --onefile
+        mcp_server.py
+
+    - name: Upload Binaries to GitHub Release
       uses: softprops/action-gh-release@v1
       with:
-        files: dist/${{ matrix.asset_name }}
+        files: |
+          dist/${{ matrix.asset_name }}
+          dist/${{ matrix.mcp_name }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

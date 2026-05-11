@@ -19,7 +19,7 @@ import os
 import platform
 
 # IMPORTANT: Update this whenever you push a new release
-CURRENT_VERSION = "1.0.0"
+CURRENT_VERSION = "1.0.1"
 GITHUB_REPO = "DEADSERPENT/claude-usage"
 
 

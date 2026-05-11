@@ -1859,6 +1859,12 @@ Environment variables:
   CLAUDE_USAGE_RBAC            Enable role-based access control (0|1)
 """
 
+def cmd_mcp():
+    """Start the MCP server (stdio transport for Claude Code integration)."""
+    import mcp_server
+    mcp_server.main()
+
+
 COMMANDS = {
     "scan":       cmd_scan,
     "today":      cmd_today,
@@ -1890,6 +1896,7 @@ COMMANDS = {
     "breaker":    cmd_circuit_breaker,
     "redact":     cmd_redact_export,
     "search":     cmd_search,
+    "mcp":        cmd_mcp,
 }
 
 def main():
