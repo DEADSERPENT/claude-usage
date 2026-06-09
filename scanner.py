@@ -9,10 +9,15 @@ import json
 import os
 import glob
 import sqlite3
+import threading
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 from config import DB_PATH, PROJECTS_DIR, ACTIVE_USER
+
+# Prevents concurrent scans from racing within the same process (e.g. daemon
+# timer firing at the same time as a file-watcher callback).
+_SCAN_LOCK = threading.Lock()
 
 
 def get_db(db_path=DB_PATH):
@@ -499,6 +504,17 @@ def insert_turns(conn, turns, user_id=None):
 
 
 def scan(projects_dir=PROJECTS_DIR, db_path=DB_PATH, verbose=True, user_id=None):
+    if not _SCAN_LOCK.acquire(blocking=False):
+        if verbose:
+            print("  Scan already in progress, skipping.")
+        return {"new": 0, "updated": 0, "skipped": 0, "turns": 0, "sessions": 0}
+    try:
+        return _scan(projects_dir, db_path, verbose, user_id)
+    finally:
+        _SCAN_LOCK.release()
+
+
+def _scan(projects_dir=PROJECTS_DIR, db_path=DB_PATH, verbose=True, user_id=None):
     conn = get_db(db_path)
     init_db(conn)
 
@@ -603,10 +619,15 @@ def scan(projects_dir=PROJECTS_DIR, db_path=DB_PATH, verbose=True, user_id=None)
                     print(f"  Warning: {e}")
 
                 turns = new_turns
-                sessions = aggregate_sessions(list(new_metas.values()) or [], turns)
+                # Aggregate only sessions that appear in the new turns so that
+                # token deltas are computed correctly.
+                new_session_ids = {t["session_id"] for t in new_turns}
+                relevant_metas = [m for m in session_metas if m["session_id"] in new_session_ids]
+                sessions = aggregate_sessions(relevant_metas, new_turns)
+                # Also upsert sessions from the file that have no new turns so
+                # that metadata (timestamps, branch) stays current.
                 for meta in session_metas:
-                    sessions_to_update = [s for s in sessions if s["session_id"] == meta["session_id"]]
-                    if not sessions_to_update:
+                    if meta["session_id"] not in new_session_ids:
                         sessions.append({**meta,
                                          "total_input_tokens": 0,
                                          "total_output_tokens": 0,

@@ -150,28 +150,33 @@ def _evaluate_condition(row: dict, cond: dict) -> bool:
     else:
         actual = row.get(field, "")
 
-    # Type coercion for numeric comparisons
+    # Numeric comparisons — try first for all relational operators.
+    # On ValueError (e.g. a date string like "2026-06-01") we fall through to
+    # lexicographic string comparison, which works correctly for ISO-8601 dates.
     if op in (">", "<", ">=", "<=") or (op in ("=", "!=") and isinstance(actual, (int, float))):
         try:
             val_num = _parse_number(val)
-            if isinstance(actual, str):
-                actual = float(actual) if actual else 0
-            if op == ">":  return actual > val_num
-            if op == "<":  return actual < val_num
-            if op == ">=": return actual >= val_num
-            if op == "<=": return actual <= val_num
-            if op == "=":  return abs(actual - val_num) < 0.0001
-            if op == "!=": return abs(actual - val_num) >= 0.0001
+            actual_num = float(actual) if isinstance(actual, str) else actual
+            if op == ">":  return actual_num > val_num
+            if op == "<":  return actual_num < val_num
+            if op == ">=": return actual_num >= val_num
+            if op == "<=": return actual_num <= val_num
+            if op == "=":  return abs(actual_num - val_num) < 0.0001
+            if op == "!=": return abs(actual_num - val_num) >= 0.0001
         except (ValueError, TypeError):
-            return False
+            pass  # fall through to string comparison
 
-    # String comparisons
+    # String comparisons (also handles date/branch/project range ops)
     actual_str = str(actual).lower()
     val_str = val.lower()
 
     if op == "=":  return actual_str == val_str
     if op == "!=": return actual_str != val_str
     if op == "~":  return val_str in actual_str
+    if op == ">":  return actual_str > val_str
+    if op == "<":  return actual_str < val_str
+    if op == ">=": return actual_str >= val_str
+    if op == "<=": return actual_str <= val_str
 
     return False
 

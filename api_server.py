@@ -39,6 +39,7 @@ Endpoints:
   POST /api/v1/circuit-breaker/reset Reset circuit breaker
 """
 
+import hmac
 import json
 import sqlite3
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -80,18 +81,24 @@ def _safe_origin(handler) -> str:
 
 
 def _check_auth(handler) -> bool:
-    """Validate bearer token if AUTH_SECRET_FILE contains a secret."""
+    """Validate bearer token if AUTH_SECRET_FILE contains a secret.
+
+    Fails closed when the file exists but cannot be read, and uses a
+    timing-safe comparison to prevent secret enumeration."""
     from config import AUTH_SECRET_FILE
     if not AUTH_SECRET_FILE.exists():
         return True
     try:
         secret = AUTH_SECRET_FILE.read_text(encoding="utf-8").strip()
     except Exception:
-        return True
+        return False  # fail-closed: secret file exists but is unreadable
     if not secret:
         return True
     auth = handler.headers.get("Authorization", "")
-    return auth == f"Bearer {secret}"
+    return hmac.compare_digest(
+        auth.encode("utf-8"),
+        f"Bearer {secret}".encode("utf-8"),
+    )
 
 
 class APIHandler(BaseHTTPRequestHandler):

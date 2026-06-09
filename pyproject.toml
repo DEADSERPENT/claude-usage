@@ -28,6 +28,9 @@ classifiers = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
 [project.urls]
 Homepage = "https://github.com/DEADSERPENT/claude-usage"
 Repository = "https://github.com/DEADSERPENT/claude-usage"
@@ -35,6 +38,12 @@ Repository = "https://github.com/DEADSERPENT/claude-usage"
 [project.scripts]
 cu = "cli:main"
 claude-usage-mcp = "mcp_server:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
 
 [tool.setuptools]
 py-modules = [

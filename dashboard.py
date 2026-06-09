@@ -3,6 +3,7 @@ dashboard.py - Local web dashboard.  Port is read from CLAUDE_USAGE_PORT
 (default 8080).  Refresh interval is driven by CLAUDE_USAGE_SCAN_INTERVAL.
 """
 
+import hmac
 import json
 import sqlite3
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -18,8 +19,58 @@ from config import (
     DASHBOARD_PORT,
     DAILY_LIMIT_USD,
     ACTIVE_USER,
+    AUTH_SECRET_FILE,
     calc_cost,
 )
+
+
+_DASHBOARD_ALLOWED_ORIGINS = {
+    "http://localhost",
+    "http://127.0.0.1",
+    f"http://localhost:{DASHBOARD_PORT}",
+    f"http://127.0.0.1:{DASHBOARD_PORT}",
+}
+
+
+def _check_auth(handler) -> bool:
+    """Return True if the request is authorized. Auth is opt-in: if
+    ~/.claude/usage_auth_secret does not exist (or is empty) every request
+    is allowed, preserving the zero-config default for local use.
+
+    When the file exists but cannot be read the request is denied (fail-closed)
+    because the user has opted into auth and we cannot verify the token."""
+    if not AUTH_SECRET_FILE.exists():
+        return True
+    try:
+        secret = AUTH_SECRET_FILE.read_text(encoding="utf-8").strip()
+    except Exception:
+        return False  # fail-closed: secret file exists but is unreadable
+    if not secret:
+        return True
+    auth = handler.headers.get("Authorization", "")
+    # Timing-safe comparison prevents secret enumeration via response timing.
+    return hmac.compare_digest(
+        auth.encode("utf-8"),
+        f"Bearer {secret}".encode("utf-8"),
+    )
+
+
+def _check_origin(handler) -> bool:
+    """Reject cross-origin POST requests (CSRF guard).
+
+    Browsers always send an Origin header for cross-origin requests. If the
+    header is absent the request came from curl/CLI/same-origin — allow it.
+    If present it must be a trusted localhost origin."""
+    origin = handler.headers.get("Origin", "")
+    if not origin:
+        return True
+    normalized = origin.rstrip("/")
+    if normalized in _DASHBOARD_ALLOWED_ORIGINS:
+        return True
+    for prefix in ("http://localhost:", "http://127.0.0.1:"):
+        if normalized.startswith(prefix):
+            return True
+    return False
 
 
 def get_dashboard_data(db_path=DB_PATH):
@@ -2203,6 +2254,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if not _check_auth(self):
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Bearer realm="claude-usage"')
+            self.end_headers()
+            return
+
         from urllib.parse import urlparse
         path = urlparse(self.path).path
 
@@ -2342,6 +2399,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
+        if not _check_auth(self):
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Bearer realm="claude-usage"')
+            self.end_headers()
+            return
+
+        if not _check_origin(self):
+            self.send_response(403)
+            self.end_headers()
+            return
+
         from urllib.parse import urlparse
         path = urlparse(self.path).path
         content_length = int(self.headers.get("Content-Length", 0))
